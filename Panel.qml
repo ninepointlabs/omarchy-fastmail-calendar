@@ -38,7 +38,7 @@ Panel {
   property bool calendarSettingsOpen: false
 
   // One service per shell — every bar widget and every open panel reads the
-  // same instance, so switching views never fires more than one Fastmail
+  // same instance, so switching views never fires more than one server
   // request at a time. A shell without service support gets a local one.
   readonly property var sharedService: bar && bar.shell && typeof bar.shell.serviceFor === "function"
     ? bar.shell.serviceFor(moduleName) : null
@@ -175,7 +175,7 @@ Panel {
 
   // ---- Calendar prefs: visibility, color, and a custom display name, each
   // written back into settings.calendarPrefs keyed by the calendar's own
-  // stable JMAP id so the choice survives a re-fetch even if Fastmail
+  // stable CalDAV path so the choice survives a re-fetch even if the server
   // reorders or momentarily omits a calendar.
   function updateCalendarPref(id, patch) {
     if (!service) return
@@ -192,7 +192,7 @@ Panel {
   function setCalendarColor(id, color) { updateCalendarPref(id, { color: color }) }
   function setCalendarName(id, name) { updateCalendarPref(id, { name: name }) }
 
-  readonly property var setupPlanValue: Model.setupPlan(service ? service.hasToken : false, service ? service.authenticated : false)
+  readonly property var setupPlanValue: Model.setupPlan(service ? service.hasCredentials : false, service ? service.authenticated : false)
   readonly property bool needsSetup: service && service.probed && setupPlanValue.needed
 
   readonly property string statusText: {
@@ -470,7 +470,7 @@ Panel {
             width: mainFlick.width
             spacing: Style.space(10)
 
-            // ---- Setup prompt (no token / signed out)
+            // ---- Setup prompt (no credentials / signed out)
             Column {
               visible: root.needsSetup
               width: parent.width
@@ -1044,8 +1044,8 @@ Panel {
             PanelSeparator { visible: root.calendarPrefs.length > 0; foreground: root.foreground }
 
             Button {
-              visible: service && service.hasToken
-              text: "FORGET FASTMAIL TOKEN"
+              visible: service && service.hasCredentials
+              text: "FORGET CALENDAR CREDENTIALS"
               foreground: root.dim
               background: "transparent"
               accent: root.accent
@@ -1053,7 +1053,7 @@ Panel {
               fontSize: Style.font.caption
               horizontalPadding: Style.space(4)
               verticalPadding: Style.space(2)
-              onClicked: if (service) service.forgetToken()
+              onClicked: if (service) service.forgetCredentials()
             }
           }
         }

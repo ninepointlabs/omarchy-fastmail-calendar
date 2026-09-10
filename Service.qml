@@ -9,9 +9,18 @@ import "Model.js" as Model
 // The plugin's data layer, instantiated once per shell as its `service`
 // entry point — every bar widget (one per monitor) and every open panel
 // reads this one instance, so switching months or opening a day never fires
-// more than one Fastmail request at a time. Read-only: there is no event
-// mutation here, only session probing, the calendar list, and the events in
-// whatever date window the panel asks for.
+// more than one request at a time. Read-only: there is no event mutation
+// here, only CalDAV discovery, the calendar list, and the events in whatever
+// date window the panel asks for.
+//
+// A refresh runs the RFC 6764 discovery chain step by step, one bounded curl
+// process per step, each parsed here before the next is chosen:
+//   account  — server + username out of the keyring (no network)
+//   discover — PROPFIND the start URL (/.well-known/caldav, or the path the
+//              user gave); follow up to five https redirects by hand
+//   principal — PROPFIND the current-user-principal for its calendar home
+//   calendars — PROPFIND Depth: 1 the home for its calendar collections
+// then the window fetch REPORTs every calendar for the visible range.
 Item {
   id: root
 
@@ -25,12 +34,14 @@ Item {
   property bool probed: false
   property bool probing: false
   property bool probeError: false
-  property bool hasToken: false
+  property bool hasCredentials: false
   property bool authenticated: false
   property bool missingTool: false
   property string lastError: ""
-  property string apiUrl: ""
-  property string accountId: ""
+  property string server: ""
+  property string username: ""
+  property string homeHref: ""
+  readonly property string origin: Model.serverOrigin(server)
 
   // ---- Calendars — every calendar on the account, regardless of the
   //      viewer's visibility choice; visibility only filters what is shown
@@ -49,12 +60,12 @@ Item {
   property string windowError: ""
   property double windowLoadedAtMs: 0
 
-  // ---- Setup flow (floating terminal) and the "forget token" action.
+  // ---- Setup flow (floating terminal) and the "forget" action.
   property bool setupRunning: false
   readonly property bool setupChecking: setupLockProcess.running
   property string actionStatus: ""
 
-  readonly property bool busy: probing || windowLoading || calendarsProcess.running || forgetProcess.running
+  readonly property bool busy: probing || windowLoading || forgetProcess.running
 
   function setting(name, fallback) {
     var value = settings ? settings[name] : undefined
@@ -62,7 +73,7 @@ Item {
   }
 
   function conciseError(value, fallback) {
-    var text = Model.cleanText(value || fallback || "Fastmail request failed", Model.remoteExcerptCharacterLimit)
+    var text = Model.cleanText(value || fallback || "Calendar request failed", Model.remoteExcerptCharacterLimit)
     return text.length > 200 ? text.substring(0, 197) + "…" : text
   }
 
@@ -73,105 +84,193 @@ Item {
     probing = true
     probeError = false
     lastError = ""
-    _sessionOut = ""
-    _sessionErr = ""
-    sessionProcess.running = true
+    _accountOut = ""
+    accountProcess.running = true
   }
 
   function refreshIfStale() {
     if (windowLoadedAtMs <= 0 || Date.now() - windowLoadedAtMs >= 300000) refresh()
   }
 
-  property string _sessionOut: ""
-  property string _sessionErr: ""
-
-  Process {
-    id: sessionProcess
-    running: false
-    command: Model.sessionRequestCommand()
-    stdout: StdioCollector { id: sessionStdout; waitForEnd: true; onStreamFinished: root._sessionOut = text }
-    stderr: StdioCollector { id: sessionStderr; waitForEnd: true; onStreamFinished: root._sessionErr = text }
-    onExited: function(exitCode) {
-      root.finishSession(exitCode, String(sessionStdout.text || root._sessionOut || ""), String(sessionStderr.text || root._sessionErr || ""))
-    }
-  }
-
-  function finishSession(exitCode, stdout, stderr) {
+  function failProbe(message, code) {
     probed = true
     probing = false
-    probeError = false
-
-    if (exitCode !== 0) {
-      var failure = Model.parseFailure(stdout, stderr)
-      missingTool = Model.isMissingToolError(failure.code)
-      hasToken = !Model.isNoTokenError(failure.code)
+    missingTool = Model.isMissingToolError(code)
+    if (missingTool) {
+      hasCredentials = false
       authenticated = false
-      apiUrl = ""
-      accountId = ""
-      if (missingTool) lastError = conciseError(failure.error, "secret-tool and curl are required")
-      else if (!hasToken) lastError = ""
-      else {
-        probeError = true
-        lastError = conciseError(failure.error, "Could not reach Fastmail")
-      }
+      lastError = conciseError(message, "secret-tool and curl are required")
       return
     }
-
-    missingTool = false
-    var session = Model.parseSession(stdout)
-    if (!session.ok) {
-      hasToken = true
+    if (Model.isNoCredentialsError(code)) {
+      hasCredentials = false
       authenticated = false
-      apiUrl = ""
-      accountId = ""
-      lastError = conciseError(session.error, "Could not sign in to Fastmail")
+      lastError = ""
       return
     }
-
-    hasToken = true
-    authenticated = true
-    lastError = ""
-    apiUrl = session.apiUrl
-    accountId = session.accountId
-    fetchCalendars()
+    hasCredentials = true
+    if (code === "auth") {
+      authenticated = false
+      lastError = conciseError(message, "The calendar server rejected the stored credentials")
+      return
+    }
+    // A network/HTTP failure with credentials present: keep whatever was
+    // already loaded on screen and surface the error, rather than bouncing
+    // the viewer back to setup for a flaky connection.
+    probeError = true
+    lastError = conciseError(message, "Could not reach the calendar server")
   }
 
-  // ------------------------------------------------------------ Calendars --
+  property string _accountOut: ""
 
-  property string _calendarsOut: ""
-  property string _calendarsErr: ""
+  Process {
+    id: accountProcess
+    running: false
+    command: Model.accountInfoCommand()
+    stdout: StdioCollector { id: accountStdout; waitForEnd: true; onStreamFinished: root._accountOut = text }
+    onExited: function(exitCode) {
+      var info = Model.parseAccountInfo(String(accountStdout.text || root._accountOut || ""))
+      if (exitCode !== 0 || info.server === "" || info.username === "") {
+        root.server = ""
+        root.username = ""
+        root.failProbe("No calendar credentials stored", "no_credentials")
+        return
+      }
+      root.server = info.server
+      root.username = info.username
+      root._stage = "discover"
+      root._redirects = 0
+      root._triedRoot = false
+      root.runStep("PROPFIND", "0", Model.discoveryStartUrl(info.server), Model.propfindDiscoveryBody())
+    }
+  }
 
-  function fetchCalendars() {
-    _calendarsOut = ""
-    _calendarsErr = ""
-    calendarsProcess.command = Model.calendarGetCommand(apiUrl, accountId)
-    calendarsProcess.running = true
+  property string _stage: ""
+  property int _redirects: 0
+  property bool _triedRoot: false
+  property string _stepUrl: ""
+  property string _stepOut: ""
+  property string _stepErr: ""
+
+  function runStep(method, depth, url, body) {
+    _stepUrl = url
+    _stepOut = ""
+    _stepErr = ""
+    stepProcess.command = Model.caldavRequestCommand(method, depth, url, body)
+    stepProcess.running = true
   }
 
   Process {
-    id: calendarsProcess
+    id: stepProcess
     running: false
     command: []
-    stdout: StdioCollector { id: calendarsStdout; waitForEnd: true; onStreamFinished: root._calendarsOut = text }
-    stderr: StdioCollector { id: calendarsStderr; waitForEnd: true; onStreamFinished: root._calendarsErr = text }
+    stdout: StdioCollector { id: stepStdout; waitForEnd: true; onStreamFinished: root._stepOut = text }
+    stderr: StdioCollector { id: stepStderr; waitForEnd: true; onStreamFinished: root._stepErr = text }
     onExited: function(exitCode) {
-      var stdout = String(calendarsStdout.text || root._calendarsOut || "")
-      var stderr = String(calendarsStderr.text || root._calendarsErr || "")
-      if (exitCode !== 0) {
-        var failure = Model.parseFailure(stdout, stderr)
-        if (Model.isAuthError(failure.code)) { root.authenticated = false; return }
-        root.lastError = root.conciseError(failure.error, "Could not list Fastmail calendars")
-        return
-      }
-      var parsed = Model.parseCalendarGet(stdout)
-      if (!parsed.ok) {
-        if (Model.isAuthError(parsed.code)) { root.authenticated = false; return }
-        root.lastError = root.conciseError(parsed.error, "Could not list Fastmail calendars")
-        return
-      }
-      root.calendars = parsed.calendars
-      if (root.windowStart !== "" && root.windowEnd !== "") root.requestWindow(root.windowStart, root.windowEnd, true)
+      root.finishStep(exitCode, String(stepStdout.text || root._stepOut || ""), String(stepStderr.text || root._stepErr || ""))
     }
+  }
+
+  function finishStep(exitCode, stdout, stderr) {
+    if (exitCode !== 0) {
+      var failure = Model.parseFailure(stdout, stderr)
+      failProbe(failure.error, failure.code)
+      return
+    }
+    var response = Model.parseHttpResponse(stdout)
+    if (!response.ok) { failProbe(response.error, "http"); return }
+
+    if (Model.isRedirectStatus(response.status)) {
+      var target = Model.validServerUrl(response.redirect)
+      if (target === "" || _redirects >= Model.maxDiscoveryRedirects) {
+        failProbe("The calendar server redirected somewhere this plugin will not follow", "http")
+        return
+      }
+      _redirects++
+      if (_stage === "calendars") runStep("PROPFIND", "1", target, Model.propfindCalendarsBody())
+      else runStep("PROPFIND", "0", target, Model.propfindDiscoveryBody())
+      return
+    }
+
+    if (response.status === 401 || response.status === 403) {
+      failProbe(Model.httpFailure(response.status).error, "auth")
+      return
+    }
+
+    if (_stage === "discover") {
+      var wellKnown = _stepUrl.indexOf("/.well-known/caldav") >= 0
+      if ((response.status === 404 || response.status === 405) && wellKnown && !_triedRoot) {
+        // No well-known support: PROPFIND the server root instead, which
+        // still answers current-user-principal on any conforming server.
+        _triedRoot = true
+        runStep("PROPFIND", "0", origin + "/", Model.propfindDiscoveryBody())
+        return
+      }
+      if (response.status !== 207 && response.status !== 200) {
+        failProbe(Model.httpFailure(response.status).error, "http")
+        return
+      }
+      var discovered = Model.parseDiscovery(response.body, origin)
+      if (!discovered.ok) { failProbe(discovered.error, "http"); return }
+      if (discovered.homeHref !== "") { startCalendars(discovered.homeHref); return }
+      if (discovered.principalHref !== "") {
+        _stage = "principal"
+        runStep("PROPFIND", "0", origin + discovered.principalHref, Model.propfindDiscoveryBody())
+        return
+      }
+      var explicitPath = Model.serverPath(server)
+      if (explicitPath !== "" && explicitPath !== "/") {
+        // The user pointed at a specific path and it answered without a
+        // principal — treat it as the calendar home itself.
+        startCalendars(explicitPath)
+        return
+      }
+      failProbe("Could not find a calendar home on this server", "http")
+      return
+    }
+
+    if (_stage === "principal") {
+      if (response.status !== 207 && response.status !== 200) {
+        failProbe(Model.httpFailure(response.status, "The principal address").error, "http")
+        return
+      }
+      var principalInfo = Model.parseDiscovery(response.body, origin)
+      if (!principalInfo.ok || principalInfo.homeHref === "") {
+        failProbe("The calendar server did not report a calendar home", "http")
+        return
+      }
+      startCalendars(principalInfo.homeHref)
+      return
+    }
+
+    if (_stage === "calendars") {
+      if (response.status !== 207 && response.status !== 200) {
+        failProbe(Model.httpFailure(response.status, "The calendar home").error, "http")
+        return
+      }
+      var listed = Model.parseCalendarList(response.body, origin)
+      if (!listed.ok) { failProbe(listed.error, "http"); return }
+      probed = true
+      probing = false
+      probeError = false
+      missingTool = false
+      hasCredentials = true
+      authenticated = true
+      lastError = ""
+      calendars = listed.calendars
+      if (windowStart !== "" && windowEnd !== "") requestWindow(windowStart, windowEnd, true)
+      else if (calendars.length === 0) windowEvents = []
+      return
+    }
+
+    failProbe("Unexpected discovery state", "http")
+  }
+
+  function startCalendars(href) {
+    homeHref = href
+    _stage = "calendars"
+    _redirects = 0
+    runStep("PROPFIND", "1", origin + href, Model.propfindCalendarsBody())
   }
 
   // -------------------------------------------------------------- Window --
@@ -180,17 +279,18 @@ Item {
   // these before calling in). `force` re-fetches even if the window is
   // unchanged — used after the calendar list loads or changes shape.
   // startKey/endKey are inclusive "YYYY-MM-DD" local calendar days; the
-  // instant range sent to Fastmail (and used to bound recurrence expansion)
-  // is midnight of startKey to midnight of the day after endKey, in this
-  // machine's own zone — the same zone every display computation already
-  // reads dates in.
+  // instant range sent to the server (and used to bound recurrence
+  // expansion) is midnight of startKey to midnight of the day after endKey,
+  // in this machine's own zone — the same zone every display computation
+  // already reads dates in.
   function requestWindow(startKey, endKey, force) {
     if (!active) return
     if (!force && startKey === windowStart && endKey === windowEnd && windowLoadedAtMs > 0) return
     windowStart = startKey
     windowEnd = endKey
-    if (!probed || !hasToken || !authenticated || apiUrl === "" || accountId === "") return
+    if (!probed || !hasCredentials || !authenticated || origin === "") return
     if (calendars.length === 0) { windowEvents = []; return }
+    if (windowLoading) { _windowQueued = true; return }
 
     var startDate = Model.dateFromKey(startKey)
     var endDate = Model.dateFromKey(endKey)
@@ -198,8 +298,8 @@ Item {
     var rangeStartMs = startDate.getTime()
     var rangeEndMs = new Date(endDate.getFullYear(), endDate.getMonth(), endDate.getDate() + 1).getTime()
 
-    var ids = []
-    for (var i = 0; i < calendars.length; i++) ids.push(calendars[i].id)
+    var hrefs = []
+    for (var i = 0; i < calendars.length; i++) hrefs.push(calendars[i].id)
 
     windowLoading = true
     windowError = ""
@@ -207,11 +307,11 @@ Item {
     _eventsErr = ""
     _windowRangeStartMs = rangeStartMs
     _windowRangeEndMs = rangeEndMs
-    eventsProcess.command = Model.calendarEventWindowCommand(
-      apiUrl, accountId, ids, new Date(rangeStartMs).toISOString(), new Date(rangeEndMs).toISOString())
+    eventsProcess.command = Model.caldavWindowCommand(origin, hrefs, rangeStartMs, rangeEndMs)
     eventsProcess.running = true
   }
 
+  property bool _windowQueued: false
   property double _windowRangeStartMs: 0
   property double _windowRangeEndMs: 0
   property string _eventsOut: ""
@@ -230,19 +330,24 @@ Item {
       root.windowLoadedAtMs = Date.now()
       if (exitCode !== 0) {
         var failure = Model.parseFailure(stdout, stderr)
-        if (Model.isAuthError(failure.code)) { root.authenticated = false; return }
-        root.windowError = root.conciseError(failure.error, "Could not load Fastmail events")
-        return
+        if (Model.isAuthError(failure.code)) { root.authenticated = false; root.lastError = root.conciseError(failure.error, ""); return }
+        root.windowError = root.conciseError(failure.error, "Could not load events")
+      } else {
+        var byId = {}
+        for (var i = 0; i < root.calendars.length; i++) byId[root.calendars[i].id] = root.calendars[i]
+        var parsed = Model.parseCalendarWindow(stdout, root._windowRangeStartMs, root._windowRangeEndMs, byId)
+        if (!parsed.ok) {
+          if (Model.isAuthError(parsed.code)) { root.authenticated = false; root.lastError = root.conciseError(parsed.error, ""); return }
+          root.windowError = root.conciseError(parsed.error, "Could not load events")
+        } else {
+          root.windowEvents = parsed.events
+          root.windowError = parsed.error
+        }
       }
-      var byId = {}
-      for (var i = 0; i < root.calendars.length; i++) byId[root.calendars[i].id] = root.calendars[i]
-      var parsed = Model.parseCalendarEventWindow(stdout, root._windowRangeStartMs, root._windowRangeEndMs, byId)
-      if (!parsed.ok) {
-        if (Model.isAuthError(parsed.code)) { root.authenticated = false; return }
-        root.windowError = parsed.error
-        return
+      if (root._windowQueued) {
+        root._windowQueued = false
+        root.requestWindow(root.windowStart, root.windowEnd, true)
       }
-      root.windowEvents = parsed.events
     }
   }
 
@@ -286,15 +391,10 @@ Item {
     }
   }
 
-  // ---------------------------------------------------------- Forget token --
+  // ---------------------------------------------------- Forget credentials --
 
-  property string _forgetOut: ""
-  property string _forgetErr: ""
-
-  function forgetToken() {
+  function forgetCredentials() {
     if (forgetProcess.running) return
-    _forgetOut = ""
-    _forgetErr = ""
     forgetProcess.running = true
   }
 
@@ -302,16 +402,15 @@ Item {
     id: forgetProcess
     running: false
     command: Model.secretClearCommand()
-    stdout: StdioCollector { id: forgetStdout; waitForEnd: true; onStreamFinished: root._forgetOut = text }
-    stderr: StdioCollector { id: forgetStderr; waitForEnd: true; onStreamFinished: root._forgetErr = text }
     onExited: function(exitCode) {
-      root.hasToken = false
+      root.hasCredentials = false
       root.authenticated = false
       root.calendars = []
       root.windowEvents = []
-      root.apiUrl = ""
-      root.accountId = ""
-      root.actionStatus = "Fastmail token removed"
+      root.server = ""
+      root.username = ""
+      root.homeHref = ""
+      root.actionStatus = "Calendar credentials removed"
       actionStatusTimer.restart()
     }
   }

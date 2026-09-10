@@ -1,5 +1,6 @@
-// Pure JS: date/grid math, timezone-safe recurrence expansion, JMAP request
-// builders/parsers and text sanitization for the Fastmail Calendar plugin. No
+// Pure JS: date/grid math, timezone-safe recurrence expansion, CalDAV
+// request builders, WebDAV/iCalendar parsers and text sanitization for the
+// Fastmail Calendar plugin (Fastmail by default, any CalDAV server). No
 // QML or Qt types here, so this stays testable under node the same way
 // Omarchy's own clock plugin — and omarchy-hey-calendar's Model.js — keep
 // their Model.js pure. The date/grid math below is copied from
@@ -411,6 +412,8 @@ function expandOccurrences(event, rangeStartMs, rangeEndMs) {
       bases = bases.concat(candidateStarts(event.recurrenceRules[r], start))
     }
     bases.sort(function(a, b) { return a.localMs - b.localMs })
+    if (bases.length === 0)
+      bases = [{ year: start.year, month: start.month - 1, day: start.day, localMs: Date.UTC(start.year, start.month - 1, start.day, start.hour, start.minute, start.second) }]
   } else {
     bases = [{ year: start.year, month: start.month - 1, day: start.day, localMs: Date.UTC(start.year, start.month - 1, start.day, start.hour, start.minute, start.second) }]
   }
@@ -564,23 +567,23 @@ function shellQuote(value) {
 function parseJson(raw, byteLimit) {
   var source = String(raw || "")
   if (exceedsUtf8ByteLimit(source, byteLimit || cliResponseByteLimit))
-    return { ok: false, error: "The Fastmail response exceeded its size limit", code: "" }
+    return { ok: false, error: "The response exceeded its size limit", code: "" }
   var text = source.trim()
-  if (text === "") return { ok: false, error: "Fastmail returned no data", code: "" }
+  if (text === "") return { ok: false, error: "The command returned no data", code: "" }
   try {
     var parsed = JSON.parse(text)
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed))
-      return { ok: false, error: "Fastmail returned invalid data", code: "" }
+      return { ok: false, error: "The command returned invalid data", code: "" }
     if (parsed.ok === false) {
       return {
         ok: false,
-        error: cleanText(parsed.error || "The Fastmail request failed", remoteErrorCharacterLimit),
+        error: cleanText(parsed.error || "The request failed", remoteErrorCharacterLimit),
         code: boundedString(parsed.code || "", remoteCodeCharacterLimit)
       }
     }
     return { ok: true, value: parsed }
   } catch (error) {
-    return { ok: false, error: "Could not parse the Fastmail response", code: "" }
+    return { ok: false, error: "Could not parse the response", code: "" }
   }
 }
 
@@ -588,21 +591,21 @@ function parseFailure(stdout, stderr) {
   var hasStderr = String(stderr || "").trim() !== ""
   var text = hasStderr ? stderr : stdout
   var result = parseJson(text, hasStderr ? cliErrorByteLimit : cliResponseByteLimit)
-  if (result.ok) return { ok: false, error: "The Fastmail request failed", code: "" }
+  if (result.ok) return { ok: false, error: "The request failed", code: "" }
   return result
 }
 
-// "auth" is a stored token Fastmail rejected or that lacks calendar access;
-// "no_token" is no token stored at all — the two need different setup
-// copy ("reconnect" vs "connect"), so they stay distinct codes rather than
-// both collapsing into one generic auth failure.
+// "auth" is a stored credential the server rejected; "no_credentials" is
+// nothing stored at all — the two need different setup copy ("reconnect" vs
+// "connect"), so they stay distinct codes rather than both collapsing into
+// one generic auth failure.
 function isAuthError(code) {
   var value = boundedString(code || "", remoteCodeCharacterLimit)
-  return value === "auth" || value === "no_token"
+  return value === "auth" || value === "no_credentials"
 }
 
-function isNoTokenError(code) {
-  return boundedString(code || "", remoteCodeCharacterLimit) === "no_token"
+function isNoCredentialsError(code) {
+  return boundedString(code || "", remoteCodeCharacterLimit) === "no_credentials"
 }
 
 function isMissingToolError(code) {
@@ -610,33 +613,71 @@ function isMissingToolError(code) {
 }
 
 // ---------------------------------------------------------------------------
-// Credential storage — a Fastmail API token, kept in the system keyring via
-// secret-tool (libsecret), under this plugin's own service/account pair.
-// Deliberately its own keyring entry: this plugin never reads any other
-// tool's cached Fastmail credentials (Hermes's OAuth cache included), and
-// nothing else can read this plugin's entry either. The token is never a
-// command-line argument or written to a file: it travels lookup -> shell
-// variable -> curl's `-K -` (config-from-stdin) header, in the memory of a
-// single short-lived process, and is validated against a plain-token
-// character class before use so a stray quote in a corrupted keyring entry
-// cannot break out of the curl config line it is interpolated into.
+// Credential storage — a CalDAV username and app password in the system
+// keyring via secret-tool (libsecret), under this plugin's own service/account
+// pair. The server URL and username ride along as *attributes* of that one
+// keyring item, so there is no plain-text config file anywhere and "forget"
+// is a single `secret-tool clear`. Deliberately its own entry: this plugin
+// never reads any other tool's stored Fastmail credentials (fm-cli's app
+// password, Hermes's OAuth cache) and nothing else reads this entry either.
+// The password is never a command-line argument and never written to a
+// file: it travels lookup -> shell variable -> curl's `-K -` (config from
+// stdin) `user =` line, in the memory of one short-lived process.
 // ---------------------------------------------------------------------------
 
 var secretService = "ninepointlabs.fastmail-calendar"
-var secretAccount = "api-token"
-var tokenCharacterPattern = /^[A-Za-z0-9._-]+$/
-var tokenCharacterLimit = 512
+var secretAccount = "caldav"
+var defaultServerUrl = "https://caldav.fastmail.com"
+var fastmailAppPasswordHelpUrl = "https://www.fastmail.help/hc/en-us/articles/360058752854-App-passwords"
+var serverUrlCharacterLimit = 512
+var usernameCharacterLimit = 256
+var maxDiscoveryRedirects = 5
+// https only, a host (optionally a port), and an optional path made of the
+// characters a URL path can carry minus anything that could break out of a
+// quoting context (quotes, backslashes, whitespace, angle brackets).
+var serverUrlPattern = /^https:\/\/[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?(?::\d{1,5})?(?:\/[A-Za-z0-9._~!$&+,;=:@%\/-]*)?$/
 
-function validToken(value) {
-  var token = String(value === undefined || value === null ? "" : value).trim()
-  if (token === "" || token.length > tokenCharacterLimit) return ""
-  return tokenCharacterPattern.test(token) ? token : ""
+function validServerUrl(value) {
+  var url = String(value === undefined || value === null ? "" : value).trim()
+  if (url === "" || url.length > serverUrlCharacterLimit) return ""
+  if (!serverUrlPattern.test(url)) return ""
+  return url.replace(/\/+$/, "")
 }
 
-var fastmailSessionUrl = "https://api.fastmail.com/jmap/session"
-var fastmailApiTokenSettingsUrl = "https://app.fastmail.com/settings/security/tokens"
-var calendarsCapability = "urn:ietf:params:jmap:calendars"
-var coreCapability = "urn:ietf:params:jmap:core"
+function serverOrigin(url) {
+  var match = String(url || "").match(/^(https:\/\/[^\/]+)/)
+  return match ? match[1] : ""
+}
+
+function serverPath(url) {
+  var match = String(url || "").match(/^https:\/\/[^\/]+(\/.*)?$/)
+  return match && match[1] ? match[1] : ""
+}
+
+// RFC 6764 bootstrapping: a bare origin starts at /.well-known/caldav (which
+// Fastmail redirects to /dav/calendars); a URL with an explicit path is
+// taken as the DAV root or calendar home the user wants to start from.
+function discoveryStartUrl(server) {
+  var url = validServerUrl(server)
+  if (url === "") return ""
+  var path = serverPath(url)
+  return (path === "" || path === "/") ? serverOrigin(url) + "/.well-known/caldav" : url
+}
+
+// A DAV href, as the server sent it, reduced to an absolute path on the
+// configured origin — anything on another origin (or anything that is not a
+// plain path) is refused rather than followed with the stored credentials.
+function resolveHref(href, origin) {
+  var value = String(href || "").trim()
+  if (value === "") return ""
+  if (/^https?:\/\//i.test(value)) {
+    if (value !== origin && value.indexOf(origin + "/") !== 0) return ""
+    value = value.substring(origin.length) || "/"
+  }
+  if (value.charAt(0) !== "/" || value.length > 1024) return ""
+  if (/[\s"'\\<>`]/.test(value) || /[\x00-\x1f\x7f]/.test(value)) return ""
+  return value
+}
 
 function secretLookupCommand() {
   return boundedCaptureCommand(["secret-tool", "lookup", "service", secretService, "account", secretAccount],
@@ -648,43 +689,724 @@ function secretClearCommand() {
     4096, cliErrorByteLimit)
 }
 
-// The one shell fragment every authenticated JMAP call runs: check the two
-// external tools exist, look the token up, validate its character class,
-// then hand it to curl as a config-from-stdin header — never as an argv
-// element (so it never appears in `ps`/`/proc/*/cmdline`) and never written
-// to disk.
-var jmapRequestShell = "method=$1; url=$2; body=$3; "
-  + "command -v secret-tool >/dev/null 2>&1 || { printf '%s' '{\"ok\":false,\"error\":\"secret-tool (libsecret) is required\",\"code\":\"missing_tool\"}' >&2; exit 1; }; "
-  + "command -v curl >/dev/null 2>&1 || { printf '%s' '{\"ok\":false,\"error\":\"curl is required\",\"code\":\"missing_tool\"}' >&2; exit 1; }; "
-  + "token=$(secret-tool lookup service " + shellQuote(secretService) + " account " + shellQuote(secretAccount) + " 2>/dev/null); "
-  + "if [ -z \"$token\" ]; then printf '%s' '{\"ok\":false,\"error\":\"No Fastmail API token stored\",\"code\":\"no_token\"}' >&2; exit 1; fi; "
-  + "case \"$token\" in *[!A-Za-z0-9._-]*) printf '%s' '{\"ok\":false,\"error\":\"Stored Fastmail token has unexpected characters\",\"code\":\"auth\"}' >&2; exit 1;; esac; "
-  + "cfg=$(printf 'header = \"Authorization: Bearer %s\"\\n' \"$token\"); "
-  + "if [ \"$method\" = POST ]; then "
-  + "printf '%s' \"$cfg\" | curl -sS --max-time 20 -K - -H 'Content-Type: application/json' --data-binary \"$body\" \"$url\"; "
-  + "else "
-  + "printf '%s' \"$cfg\" | curl -sS --max-time 20 -K - \"$url\"; "
-  + "fi"
+// The non-secret half of the keyring item. `secret-tool search` prints the
+// item's attributes alongside its secret; only the `attribute.` lines are
+// let through, so the password itself never reaches this process's stdout.
+var accountInfoShell = "secret-tool search service " + shellQuote(secretService) + " account " + shellQuote(secretAccount)
+  + " 2>&1 | grep '^attribute\\.' || true"
 
-function jmapRequestCommand(method, url, body) {
-  return boundedCaptureCommand(
-    ["bash", "-c", jmapRequestShell, "fmcal-jmap", String(method || "GET"), String(url || ""), String(body || "")],
-    cliResponseByteLimit, cliErrorByteLimit)
+function accountInfoCommand() {
+  return boundedCaptureCommand(["bash", "-c", accountInfoShell, "fmcal-account"], 4096, cliErrorByteLimit)
 }
 
-// The probe: is a token stored and does it reach a Fastmail account with the
-// calendars capability. Reuses the same request path every other call uses,
-// so a probe success is a real guarantee the rest will work too.
-function probeCommand() {
-  return jmapRequestCommand("GET", fastmailSessionUrl, "")
+function parseAccountInfo(raw) {
+  var server = "", username = ""
+  var lines = String(raw || "").split("\n")
+  for (var i = 0; i < lines.length && i < 64; i++) {
+    var match = lines[i].match(/^attribute\.(server|username) = (.*)$/)
+    if (!match) continue
+    if (match[1] === "server" && server === "") server = validServerUrl(match[2])
+    if (match[1] === "username" && username === "") username = boundedString(match[2].trim(), usernameCharacterLimit)
+  }
+  return { server: server, username: username }
+}
+
+// The shell prelude every authenticated request runs: check the two external
+// tools exist, read the username (attribute) and password (secret) out of the
+// keyring, refuse either if it carries a control character, and build curl's
+// config-from-stdin `user =` line with backslash and double quote escaped the
+// way curl's config parser expects. Nothing here touches argv or disk.
+var caldavCredentialShell = ""
+  + "command -v secret-tool >/dev/null 2>&1 || { printf '%s' '{\"ok\":false,\"error\":\"secret-tool (libsecret) is required\",\"code\":\"missing_tool\"}' >&2; exit 1; }; "
+  + "command -v curl >/dev/null 2>&1 || { printf '%s' '{\"ok\":false,\"error\":\"curl is required\",\"code\":\"missing_tool\"}' >&2; exit 1; }; "
+  + "info=$(secret-tool search service " + shellQuote(secretService) + " account " + shellQuote(secretAccount) + " 2>&1 | grep '^attribute\\.' || true); "
+  + "username=$(printf '%s\\n' \"$info\" | sed -n 's/^attribute\\.username = //p' | head -n 1); "
+  + "password=$(secret-tool lookup service " + shellQuote(secretService) + " account " + shellQuote(secretAccount) + " 2>/dev/null); "
+  + "if [ -z \"$password\" ] || [ -z \"$username\" ]; then printf '%s' '{\"ok\":false,\"error\":\"No calendar credentials stored\",\"code\":\"no_credentials\"}' >&2; exit 1; fi; "
+  + "case \"$username$password\" in *[[:cntrl:]]*) printf '%s' '{\"ok\":false,\"error\":\"Stored calendar credentials have unexpected characters\",\"code\":\"auth\"}' >&2; exit 1;; esac; "
+  + "esc() { printf '%s' \"$1\" | sed 's/[\\\\\"]/\\\\&/g'; }; "
+  + "cfg=$(printf 'user = \"%s:%s\"\\n' \"$(esc \"$username\")\" \"$(esc \"$password\")\"); "
+  + "unset password; "
+
+var curlCommon = "curl -sS --max-time 25 --proto =https --max-redirs 0 -K - "
+  + "-H 'Content-Type: application/xml; charset=utf-8' "
+  + "-w '\\n--fmcal-http-- %{http_code} %{redirect_url}\\n'"
+var networkFailure = "{ printf '%s' '{\"ok\":false,\"error\":\"Could not reach the calendar server\",\"code\":\"network\"}' >&2; exit 1; }"
+
+// One request: method, Depth header, URL and XML body as positional args
+// (none of them secret), credentials from the prelude. curl handles no
+// redirects itself — the caller sees the 3xx plus its Location and decides,
+// so the credentials are never replayed to a host this code did not vet.
+var caldavRequestShell = "method=$1; depth=$2; url=$3; body=$4; " + caldavCredentialShell
+  + "printf '%s\\n' \"$cfg\" | " + curlCommon + " -X \"$method\" -H \"Depth: $depth\" --data-binary \"$body\" \"$url\" || " + networkFailure
+
+function caldavRequestCommand(method, depth, url, body, stdoutLimit) {
+  return boundedCaptureCommand(
+    ["bash", "-c", caldavRequestShell, "fmcal-caldav", String(method || "PROPFIND"), String(depth || "0"), String(url || ""), String(body || "")],
+    stdoutLimit || cliResponseByteLimit, cliErrorByteLimit)
+}
+
+// The window fetch: one calendar-query REPORT per calendar href, all in one
+// process so the keyring is read once, each response framed by a begin line
+// carrying its href and the same status trailer as a single request.
+var caldavWindowShell = "origin=$1; body=$2; shift 2; " + caldavCredentialShell
+  + "for href in \"$@\"; do printf '\\n--fmcal-begin-- %s\\n' \"$href\"; "
+  + "printf '%s\\n' \"$cfg\" | " + curlCommon + " -X REPORT -H 'Depth: 1' --data-binary \"$body\" \"$origin$href\" || " + networkFailure + "; "
+  + "done"
+
+var windowResponseByteLimit = 8 * 1024 * 1024
+
+function caldavWindowCommand(origin, hrefs, startUtcMs, endUtcMs) {
+  var args = ["bash", "-c", caldavWindowShell, "fmcal-caldav-window", String(origin || ""), calendarQueryBody(startUtcMs, endUtcMs)]
+  var list = Array.isArray(hrefs) ? hrefs : []
+  for (var i = 0; i < list.length && i < 128; i++) args.push(String(list[i]))
+  return boundedCaptureCommand(args, windowResponseByteLimit, cliErrorByteLimit, 90)
+}
+
+// Splits curl's output into body + status trailer. A missing trailer means
+// the process died before curl could report (or output was cut by the size
+// guard), which is an error rather than a body to parse.
+function parseHttpResponse(raw, byteLimit) {
+  var text = String(raw || "")
+  if (exceedsUtf8ByteLimit(text, byteLimit || cliResponseByteLimit))
+    return { ok: false, error: "The calendar server response exceeded its size limit", code: "", status: 0, redirect: "", body: "" }
+  var match = text.match(/\n--fmcal-http-- (\d{3}) (\S*)\n?$/)
+  if (!match)
+    return { ok: false, error: "The calendar server returned no status", code: "", status: 0, redirect: "", body: "" }
+  return { ok: true, error: "", code: "", status: parseInt(match[1], 10), redirect: boundedString(match[2], 2048), body: text.substring(0, match.index) }
+}
+
+function isRedirectStatus(status) {
+  return status === 301 || status === 302 || status === 303 || status === 307 || status === 308
+}
+
+// Maps an HTTP failure to the same error/code envelope the shell scripts
+// use, so the service treats a 401 from curl exactly like a keyring miss.
+function httpFailure(status, what) {
+  var label = what || "The calendar server"
+  if (status === 401 || status === 403) return { error: label + " rejected the stored username and password", code: "auth" }
+  if (status === 404) return { error: label + " has nothing at that address (HTTP 404)", code: "not_found" }
+  if (status === 405) return { error: label + " does not accept that request there (HTTP 405)", code: "not_found" }
+  return { error: label + " answered HTTP " + status, code: "http" }
+}
+
+function parseWindowResponses(raw) {
+  var text = String(raw || "")
+  if (exceedsUtf8ByteLimit(text, windowResponseByteLimit))
+    return { ok: false, error: "The calendar server response exceeded its size limit", code: "", responses: [] }
+  var segments = text.split("\n--fmcal-begin-- ")
+  var responses = []
+  for (var i = 1; i < segments.length && i <= 128; i++) {
+    var newline = segments[i].indexOf("\n")
+    if (newline < 0) continue
+    var href = boundedString(segments[i].substring(0, newline), 1024)
+    var response = parseHttpResponse(segments[i].substring(newline + 1), windowResponseByteLimit)
+    responses.push({ href: href, status: response.ok ? response.status : 0, body: response.ok ? response.body : "", error: response.ok ? "" : response.error })
+  }
+  return { ok: true, error: "", code: "", responses: responses }
 }
 
 // ---------------------------------------------------------------------------
-// Setup: a floating terminal that prompts for the token, checks it against
-// Fastmail before storing it, and stores it via secret-tool's own stdin
-// interface (never argv). Structure (lock dir, EXIT trap, IPC completion
-// callback) adapted from omarchy-fastmail's Model.js; see
-// THIRD_PARTY_NOTICES.md.
+// A small XML reader for WebDAV multistatus bodies. Element names are kept
+// as their local part (prefixes vary by server: D:, d:, A:, cal:), text is
+// entity-decoded, attributes are captured, comments/PIs/DOCTYPEs are skipped
+// and never expanded, so an untrusted body can at most be malformed — which
+// simply yields a tree with nothing useful in it.
+// ---------------------------------------------------------------------------
+
+var xmlMaxNodes = 200000
+
+function decodeXmlEntities(text) {
+  return String(text || "").replace(/&(#x[0-9a-fA-F]+|#\d+|lt|gt|amp|quot|apos);/g, function(whole, entity) {
+    if (entity === "lt") return "<"
+    if (entity === "gt") return ">"
+    if (entity === "amp") return "&"
+    if (entity === "quot") return "\""
+    if (entity === "apos") return "'"
+    var code = entity.charAt(1) === "x" ? parseInt(entity.substring(2), 16) : parseInt(entity.substring(1), 10)
+    if (!isFinite(code) || code < 0 || code > 0x10FFFF) return ""
+    try { return String.fromCodePoint(code) } catch (error) { return "" }
+  })
+}
+
+function xmlLocalName(name) {
+  var value = String(name || "")
+  var colon = value.indexOf(":")
+  return (colon >= 0 ? value.substring(colon + 1) : value).toLowerCase()
+}
+
+function parseXmlAttributes(source) {
+  var attrs = {}
+  var pattern = /([^\s=\/]+)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'>]+))/g
+  var match
+  while ((match = pattern.exec(String(source || ""))) !== null) {
+    attrs[xmlLocalName(match[1])] = decodeXmlEntities(match[2] !== undefined ? match[2] : (match[3] !== undefined ? match[3] : match[4]))
+  }
+  return attrs
+}
+
+function parseXml(text) {
+  var root = { name: "#root", attrs: {}, children: [], text: "" }
+  var stack = [root]
+  var nodes = 0
+  var pattern = /<!--[\s\S]*?-->|<!\[CDATA\[([\s\S]*?)\]\]>|<\?[\s\S]*?\?>|<!DOCTYPE[^>]*>|<\/([^\s>]+)\s*>|<([^\s\/>]+)((?:\s+[^\s=\/>]+(?:\s*=\s*(?:"[^"]*"|'[^']*'|[^\s"'>]+))?)*)\s*(\/?)>|([^<]+)/g
+  var match
+  var source = String(text || "")
+  while ((match = pattern.exec(source)) !== null) {
+    var current = stack[stack.length - 1]
+    if (match[1] !== undefined) {
+      current.text += match[1]
+    } else if (match[2] !== undefined) {
+      if (stack.length > 1) stack.pop()
+    } else if (match[3] !== undefined) {
+      if (++nodes > xmlMaxNodes) break
+      var node = { name: xmlLocalName(match[3]), attrs: parseXmlAttributes(match[4]), children: [], text: "" }
+      current.children.push(node)
+      if (match[5] !== "/") stack.push(node)
+    } else if (match[6] !== undefined) {
+      current.text += decodeXmlEntities(match[6])
+    }
+  }
+  return root
+}
+
+function xmlChildren(node, name) {
+  if (!node || !Array.isArray(node.children)) return []
+  var out = []
+  for (var i = 0; i < node.children.length; i++) if (node.children[i].name === name) out.push(node.children[i])
+  return out
+}
+
+function xmlFind(node, name) {
+  if (!node || !Array.isArray(node.children)) return null
+  for (var i = 0; i < node.children.length; i++) {
+    if (node.children[i].name === name) return node.children[i]
+    var deeper = xmlFind(node.children[i], name)
+    if (deeper) return deeper
+  }
+  return null
+}
+
+function xmlText(node) {
+  return node ? String(node.text || "").trim() : ""
+}
+
+// ---------------------------------------------------------------------------
+// WebDAV / CalDAV bodies and multistatus parsing
+// ---------------------------------------------------------------------------
+
+var davNamespaces = "xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:caldav\" xmlns:A=\"http://apple.com/ns/ical/\""
+
+function propfindDiscoveryBody() {
+  return "<?xml version=\"1.0\" encoding=\"utf-8\"?>"
+    + "<D:propfind " + davNamespaces + "><D:prop>"
+    + "<D:current-user-principal/><C:calendar-home-set/><D:resourcetype/>"
+    + "</D:prop></D:propfind>"
+}
+
+function propfindCalendarsBody() {
+  return "<?xml version=\"1.0\" encoding=\"utf-8\"?>"
+    + "<D:propfind " + davNamespaces + "><D:prop>"
+    + "<D:displayname/><D:resourcetype/><C:supported-calendar-component-set/>"
+    + "<A:calendar-color/><A:calendar-order/>"
+    + "</D:prop></D:propfind>"
+}
+
+// "YYYYMMDDTHHMMSSZ" — the only date-time form a CalDAV time-range accepts.
+function utcStamp(ms) {
+  var date = new Date(ms)
+  return date.getUTCFullYear() + pad2(date.getUTCMonth() + 1) + pad2(date.getUTCDate())
+    + "T" + pad2(date.getUTCHours()) + pad2(date.getUTCMinutes()) + pad2(date.getUTCSeconds()) + "Z"
+}
+
+// RFC 4791 §7.8.1: every VEVENT overlapping the window, recurring masters
+// included (servers evaluate a time-range against expanded instances), each
+// returned as its whole iCalendar object — master plus every override.
+function calendarQueryBody(startUtcMs, endUtcMs) {
+  return "<?xml version=\"1.0\" encoding=\"utf-8\"?>"
+    + "<C:calendar-query " + davNamespaces + ">"
+    + "<D:prop><D:getetag/><C:calendar-data/></D:prop>"
+    + "<C:filter><C:comp-filter name=\"VCALENDAR\"><C:comp-filter name=\"VEVENT\">"
+    + "<C:time-range start=\"" + utcStamp(startUtcMs) + "\" end=\"" + utcStamp(endUtcMs) + "\"/>"
+    + "</C:comp-filter></C:comp-filter></C:filter>"
+    + "</C:calendar-query>"
+}
+
+function parseMultistatus(body) {
+  var doc = parseXml(body)
+  var multistatus = xmlFind(doc, "multistatus")
+  if (!multistatus) return null
+  var out = []
+  var responses = xmlChildren(multistatus, "response")
+  for (var i = 0; i < responses.length && i < 5000; i++) {
+    var response = responses[i]
+    var href = xmlText(xmlChildren(response, "href")[0])
+    var props = []
+    var propstats = xmlChildren(response, "propstat")
+    for (var p = 0; p < propstats.length; p++) {
+      var status = xmlText(xmlChildren(propstats[p], "status")[0])
+      if (status !== "" && !/\b2\d\d\b/.test(status)) continue
+      var propNodes = xmlChildren(propstats[p], "prop")
+      for (var q = 0; q < propNodes.length; q++) props.push(propNodes[q])
+    }
+    out.push({ href: href, props: props })
+  }
+  return out
+}
+
+// From a PROPFIND on any resource: where the calendar home is (directly, or
+// via the principal that knows), both reduced to same-origin paths.
+function parseDiscovery(body, origin) {
+  var result = { ok: false, error: "", homeHref: "", principalHref: "" }
+  var responses = parseMultistatus(body)
+  if (!responses) { result.error = "The calendar server did not answer with a WebDAV multistatus"; return result }
+  for (var i = 0; i < responses.length; i++) {
+    for (var p = 0; p < responses[i].props.length; p++) {
+      var prop = responses[i].props[p]
+      var home = xmlFind(prop, "calendar-home-set")
+      var homeHref = home ? resolveHref(xmlText(xmlChildren(home, "href")[0]), origin) : ""
+      if (homeHref !== "" && result.homeHref === "") result.homeHref = homeHref
+      var principal = xmlFind(prop, "current-user-principal")
+      var principalHref = principal ? resolveHref(xmlText(xmlChildren(principal, "href")[0]), origin) : ""
+      if (principalHref !== "" && result.principalHref === "") result.principalHref = principalHref
+    }
+  }
+  result.ok = true
+  return result
+}
+
+function normalizeCalendarColor(value) {
+  var text = String(value || "").trim()
+  var match = text.match(/^#([0-9a-fA-F]{6})(?:[0-9a-fA-F]{2})?$/)
+  if (match) return "#" + match[1].toUpperCase()
+  var short = text.match(/^#([0-9a-fA-F]{3})$/)
+  if (short) return ("#" + short[1].charAt(0) + short[1].charAt(0) + short[1].charAt(1) + short[1].charAt(1) + short[1].charAt(2) + short[1].charAt(2)).toUpperCase()
+  return ""
+}
+
+function calendarNameFromHref(href) {
+  var segments = String(href || "").replace(/\/+$/, "").split("/")
+  var last = segments[segments.length - 1] || "Calendar"
+  try { return decodeURIComponent(last) } catch (error) { return last }
+}
+
+// From a Depth: 1 PROPFIND on the calendar home: every collection that is a
+// calendar holding events (schedule in/outboxes and task-only collections
+// are skipped), keyed by its path — the one stable id a CalDAV calendar has.
+function parseCalendarList(body, origin) {
+  var responses = parseMultistatus(body)
+  if (!responses) return { ok: false, error: "The calendar server did not answer with a WebDAV multistatus", code: "", calendars: [] }
+  var calendars = []
+  for (var i = 0; i < responses.length && calendars.length < 128; i++) {
+    var href = resolveHref(responses[i].href, origin)
+    if (href === "") continue
+    var isCalendar = false, isSchedule = false, holdsEvents = true
+    var name = "", color = "", order = 0
+    for (var p = 0; p < responses[i].props.length; p++) {
+      var prop = responses[i].props[p]
+      var resourcetype = xmlFind(prop, "resourcetype")
+      if (resourcetype) {
+        if (xmlChildren(resourcetype, "calendar").length > 0) isCalendar = true
+        if (xmlChildren(resourcetype, "schedule-inbox").length > 0 || xmlChildren(resourcetype, "schedule-outbox").length > 0) isSchedule = true
+      }
+      var components = xmlFind(prop, "supported-calendar-component-set")
+      if (components) {
+        var comps = xmlChildren(components, "comp")
+        if (comps.length > 0) {
+          holdsEvents = false
+          for (var c = 0; c < comps.length; c++) if (String(comps[c].attrs.name || "").toUpperCase() === "VEVENT") holdsEvents = true
+        }
+      }
+      var displayname = xmlFind(prop, "displayname")
+      if (displayname && name === "") name = xmlText(displayname)
+      var colorNode = xmlFind(prop, "calendar-color")
+      if (colorNode && color === "") color = normalizeCalendarColor(xmlText(colorNode))
+      var orderNode = xmlFind(prop, "calendar-order")
+      if (orderNode) order = parseInt(xmlText(orderNode), 10) || 0
+    }
+    if (!isCalendar || isSchedule || !holdsEvents) continue
+    calendars.push({
+      id: href,
+      name: cleanText(name || calendarNameFromHref(href), remoteNameCharacterLimit),
+      color: color,
+      sortOrder: order,
+      isOwner: true
+    })
+  }
+  calendars.sort(function(a, b) { return a.sortOrder - b.sortOrder || a.name.localeCompare(b.name) })
+  return { ok: true, error: "", code: "", calendars: calendars }
+}
+
+// ---------------------------------------------------------------------------
+// iCalendar (RFC 5545) reading — just enough of it for a viewer: unfolding,
+// property parameters, text escapes, nested components, DATE vs DATE-TIME
+// values in UTC / a TZID / floating, DTEND-or-DURATION, RRULE, EXDATE and
+// RECURRENCE-ID overrides. Everything is mapped onto the same normalized
+// event shape the recurrence engine above already expands.
+// ---------------------------------------------------------------------------
+
+function unfoldIcs(text) {
+  return String(text || "").replace(/\r\n|\r|\n/g, "\n").replace(/\n[ \t]/g, "")
+}
+
+function icsUnescape(value) {
+  return String(value || "").replace(/\\([\\;,nN])/g, function(whole, ch) {
+    return (ch === "n" || ch === "N") ? "\n" : ch
+  })
+}
+
+// NAME;PARAM=a,"b;c";OTHER=x:value — parameter values may be quoted (and
+// then hold ; , :), so this is a scan rather than a split.
+function parseIcsLine(line) {
+  var text = String(line || "")
+  var i = 0, length = text.length
+  var name = ""
+  while (i < length && text[i] !== ";" && text[i] !== ":") name += text[i++]
+  if (name === "") return null
+  var params = {}
+  while (i < length && text[i] === ";") {
+    i++
+    var paramName = ""
+    while (i < length && text[i] !== "=" && text[i] !== ";" && text[i] !== ":") paramName += text[i++]
+    var values = []
+    if (i < length && text[i] === "=") {
+      i++
+      for (;;) {
+        var value = ""
+        if (i < length && text[i] === "\"") {
+          i++
+          while (i < length && text[i] !== "\"") value += text[i++]
+          if (i < length) i++
+        } else {
+          while (i < length && text[i] !== "," && text[i] !== ";" && text[i] !== ":") value += text[i++]
+        }
+        values.push(value)
+        if (i < length && text[i] === ",") { i++; continue }
+        break
+      }
+    }
+    params[paramName.toUpperCase()] = values
+  }
+  if (i >= length || text[i] !== ":") return null
+  return { name: name.toUpperCase(), params: params, value: text.substring(i + 1) }
+}
+
+function parseIcs(text) {
+  var root = { name: "#root", props: [], components: [] }
+  var stack = [root]
+  var lines = unfoldIcs(text).split("\n")
+  for (var i = 0; i < lines.length && i < 200000; i++) {
+    if (lines[i] === "") continue
+    var prop = parseIcsLine(lines[i])
+    if (!prop) continue
+    if (prop.name === "BEGIN") {
+      var component = { name: prop.value.trim().toUpperCase(), props: [], components: [] }
+      stack[stack.length - 1].components.push(component)
+      stack.push(component)
+    } else if (prop.name === "END") {
+      if (stack.length > 1) stack.pop()
+    } else {
+      stack[stack.length - 1].props.push(prop)
+    }
+  }
+  return root
+}
+
+function icsProp(component, name) {
+  for (var i = 0; i < component.props.length; i++) if (component.props[i].name === name) return component.props[i]
+  return null
+}
+
+function icsProps(component, name) {
+  var out = []
+  for (var i = 0; i < component.props.length; i++) if (component.props[i].name === name) out.push(component.props[i])
+  return out
+}
+
+function icsComponents(component, name, out) {
+  var list = out || []
+  for (var i = 0; i < component.components.length; i++) {
+    if (component.components[i].name === name) list.push(component.components[i])
+    icsComponents(component.components[i], name, list)
+  }
+  return list
+}
+
+// A TZID is trusted only if the platform's own zone database knows it;
+// otherwise the trailing "Area/City" of a namespaced id (e.g. the
+// "/freeassociation.sourceforge.net/Tzfile/America/Chicago" form) is tried,
+// and failing that the time is read as floating. Windows-style names
+// ("Central Standard Time") fall into that last bucket — the wall clock
+// shown is then the one typed, in the viewer's zone.
+var knownTimeZones = {}
+
+function intlKnowsTimeZone(name) {
+  if (Object.prototype.hasOwnProperty.call(knownTimeZones, name)) return knownTimeZones[name]
+  var known = false
+  try { new Intl.DateTimeFormat("en-US", { timeZone: name }); known = true } catch (error) { known = false }
+  knownTimeZones[name] = known
+  return known
+}
+
+function normalizeTzid(value) {
+  var tzid = String(value || "").trim()
+  if (tzid === "" || tzid.length > 128) return ""
+  if (/^(Z|UTC|GMT|Etc\/UTC|Etc\/GMT)$/i.test(tzid)) return "UTC"
+  if (intlKnowsTimeZone(tzid)) return tzid
+  var segments = tzid.split("/").filter(function(part) { return part !== "" })
+  for (var take = 2; take <= 3 && take <= segments.length; take++) {
+    var candidate = segments.slice(segments.length - take).join("/")
+    if (/^[A-Za-z0-9_+\-\/]+$/.test(candidate) && intlKnowsTimeZone(candidate)) return candidate
+  }
+  return ""
+}
+
+function icsDateValue(prop, fallbackTz) {
+  if (!prop) return null
+  var raw = String(prop.value || "").trim()
+  var isDate = (prop.params.VALUE && String(prop.params.VALUE[0] || "").toUpperCase() === "DATE") || /^\d{8}$/.test(raw)
+  if (isDate) {
+    var d = raw.match(/^(\d{4})(\d{2})(\d{2})$/)
+    if (!d) return null
+    return { allDay: true, local: d[1] + "-" + d[2] + "-" + d[3] + "T00:00:00", tz: "" }
+  }
+  var m = raw.match(/^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})(Z?)$/)
+  if (!m) return null
+  var local = m[1] + "-" + m[2] + "-" + m[3] + "T" + m[4] + ":" + m[5] + ":" + m[6]
+  var tz = m[7] === "Z" ? "UTC" : (prop.params.TZID ? normalizeTzid(prop.params.TZID[0]) : (fallbackTz || ""))
+  return { allDay: false, local: local, tz: tz }
+}
+
+// Any date value, re-expressed as a local string in the master's zone —
+// the key shape expandOccurrences matches overrides by.
+function localKeyInZone(value, masterTz, masterAllDay) {
+  if (!value) return ""
+  if (masterAllDay || value.allDay) return value.local.substring(0, 10) + "T00:00:00"
+  if (value.tz === masterTz) return value.local
+  var instant = zonedTimeToUtcMs(value.local, value.tz)
+  if (isNaN(instant)) return ""
+  return utcMsToLocalString(instant, masterTz)
+}
+
+var ICS_WEEKDAYS = { SU: "su", MO: "mo", TU: "tu", WE: "we", TH: "th", FR: "fr", SA: "sa" }
+
+// RRULE text to the JSCalendar-shaped rule candidateStarts reads. UNTIL is
+// re-expressed in the master's own zone (it arrives in UTC for a zoned
+// start, per RFC 5545), a DATE-valued UNTIL covers its whole last day.
+function parseRrule(value, masterTz) {
+  var rule = {}
+  var parts = String(value || "").split(";")
+  for (var i = 0; i < parts.length; i++) {
+    var eq = parts[i].indexOf("=")
+    if (eq < 0) continue
+    var key = parts[i].substring(0, eq).toUpperCase()
+    var val = parts[i].substring(eq + 1)
+    if (key === "FREQ") rule.frequency = val.toLowerCase()
+    else if (key === "INTERVAL") rule.interval = parseInt(val, 10) || 1
+    else if (key === "COUNT") rule.count = parseInt(val, 10) || 0
+    else if (key === "UNTIL") {
+      var until = icsDateValue({ value: val, params: {} }, "")
+      if (until && until.allDay) rule.until = until.local.substring(0, 10) + "T23:59:59"
+      else if (until && until.tz === "UTC") rule.until = utcMsToLocalString(zonedTimeToUtcMs(until.local, "UTC"), masterTz)
+      else if (until) rule.until = until.local
+    } else if (key === "BYDAY") {
+      rule.byDay = []
+      var days = val.split(",")
+      for (var d = 0; d < days.length; d++) {
+        var m = days[d].trim().toUpperCase().match(/^([+-]?\d{1,2})?(SU|MO|TU|WE|TH|FR|SA)$/)
+        if (!m) continue
+        var entry = { day: ICS_WEEKDAYS[m[2]] }
+        if (m[1] !== undefined) entry.nthOfPeriod = parseInt(m[1], 10)
+        rule.byDay.push(entry)
+      }
+    } else if (key === "BYMONTHDAY") {
+      rule.byMonthDay = val.split(",").map(function(n) { return parseInt(n, 10) }).filter(function(n) { return isFinite(n) && n !== 0 })
+    } else if (key === "BYMONTH") {
+      rule.byMonth = val.split(",").map(function(n) { return parseInt(n, 10) }).filter(function(n) { return n >= 1 && n <= 12 })
+    }
+    // BYSETPOS, BYYEARDAY, BYWEEKNO, BYHOUR and finer, WKST: not supported;
+    // the event still shows on its start and whatever the rest of the rule
+    // yields, per the README.
+  }
+  return rule.frequency ? rule : null
+}
+
+function icsDurationMs(component, start) {
+  var duration = icsProp(component, "DURATION")
+  if (duration) return parseIso8601Duration(String(duration.value || "").replace(/^\+/, ""))
+  var end = icsDateValue(icsProp(component, "DTEND"), start.tz)
+  if (!end) return start.allDay ? MS_PER_DAY : 0
+  if (start.allDay) {
+    var s = parseLocalDateTime(start.local), e = parseLocalDateTime(end.local)
+    var days = Math.round((Date.UTC(e.year, e.month - 1, e.day) - Date.UTC(s.year, s.month - 1, s.day)) / MS_PER_DAY)
+    return Math.max(1, days) * MS_PER_DAY
+  }
+  var startMs = zonedTimeToUtcMs(start.local, start.tz)
+  var endMs = zonedTimeToUtcMs(end.local, end.tz)
+  return (isNaN(startMs) || isNaN(endMs)) ? 0 : Math.max(0, endMs - startMs)
+}
+
+function icsText(component, name, limit) {
+  var prop = icsProp(component, name)
+  return prop ? cleanText(icsUnescape(prop.value), limit) : ""
+}
+
+// One calendar object (one UID: a master VEVENT plus any RECURRENCE-ID
+// instances) to the normalized event the recurrence engine expands. An
+// object holding only detached instances (an invitation to a single
+// occurrence, say) yields each of them as a standalone event.
+function normalizeIcsObject(vevents, objectHref, calendarId) {
+  var master = null, instances = []
+  for (var i = 0; i < vevents.length; i++) {
+    if (icsProp(vevents[i], "RECURRENCE-ID")) instances.push(vevents[i])
+    else if (!master) master = vevents[i]
+  }
+  var out = []
+  if (!master) {
+    for (var s = 0; s < instances.length && s < 500; s++) {
+      var standalone = normalizeIcsEvent(instances[s], objectHref + "#" + s, calendarId, [])
+      if (standalone) out.push(standalone)
+    }
+    return out
+  }
+  var normalized = normalizeIcsEvent(master, objectHref, calendarId, instances)
+  if (normalized) out.push(normalized)
+  return out
+}
+
+function normalizeIcsEvent(vevent, id, calendarId, instances) {
+  var start = icsDateValue(icsProp(vevent, "DTSTART"), "")
+  if (!start) return null
+  var status = String((icsProp(vevent, "STATUS") || { value: "" }).value || "").trim().toUpperCase()
+  var rruleProp = icsProp(vevent, "RRULE")
+  var rule = rruleProp ? parseRrule(rruleProp.value, start.tz) : null
+  var overrides = {}
+
+  var exdates = icsProps(vevent, "EXDATE")
+  for (var e = 0; e < exdates.length; e++) {
+    var values = String(exdates[e].value || "").split(",")
+    for (var v = 0; v < values.length && v < 2000; v++) {
+      var ex = icsDateValue({ value: values[v].trim(), params: exdates[e].params }, start.tz)
+      var exKey = localKeyInZone(ex, start.tz, start.allDay)
+      if (exKey !== "") overrides[exKey] = { excluded: true }
+    }
+  }
+
+  for (var n = 0; n < instances.length && n < 2000; n++) {
+    var instance = instances[n]
+    var recurrenceId = icsDateValue(icsProp(instance, "RECURRENCE-ID"), start.tz)
+    var key = localKeyInZone(recurrenceId, start.tz, start.allDay)
+    if (key === "") continue
+    var instanceStatus = String((icsProp(instance, "STATUS") || { value: "" }).value || "").trim().toUpperCase()
+    if (instanceStatus === "CANCELLED") { overrides[key] = { excluded: true }; continue }
+    var instanceStart = icsDateValue(icsProp(instance, "DTSTART"), start.tz)
+    var patch = { excluded: false }
+    var movedTo = localKeyInZone(instanceStart, start.tz, start.allDay)
+    if (movedTo !== "" && movedTo !== key) patch.start = movedTo
+    if (instanceStart) patch.durationMs = icsDurationMs(instance, instanceStart)
+    if (icsProp(instance, "SUMMARY")) patch.title = icsText(instance, "SUMMARY", remoteTitleCharacterLimit) || "Untitled event"
+    if (icsProp(instance, "DESCRIPTION")) patch.description = icsText(instance, "DESCRIPTION", remoteExcerptCharacterLimit)
+    if (icsProp(instance, "LOCATION")) patch.location = icsText(instance, "LOCATION", remoteNameCharacterLimit)
+    overrides[key] = patch
+  }
+
+  return {
+    id: boundedString(id, 1024),
+    uid: boundedString((icsProp(vevent, "UID") || { value: id }).value || id, remoteIdCharacterLimit),
+    title: icsText(vevent, "SUMMARY", remoteTitleCharacterLimit) || "Untitled event",
+    description: icsText(vevent, "DESCRIPTION", remoteExcerptCharacterLimit),
+    location: icsText(vevent, "LOCATION", remoteNameCharacterLimit),
+    allDay: start.allDay,
+    startLocal: start.local,
+    timeZone: start.allDay ? "" : start.tz,
+    durationMs: icsDurationMs(vevent, start),
+    recurrenceRules: rule ? [rule] : null,
+    recurrenceOverrides: overrides,
+    calendarId: calendarId,
+    status: status === "CANCELLED" ? "cancelled" : "confirmed"
+  }
+}
+
+// One calendar's REPORT body to expanded occurrences inside
+// [rangeStartMs, rangeEndMs), each carrying its calendar's name and color.
+function parseCalendarObjects(body, calendar, rangeStartMs, rangeEndMs) {
+  var responses = parseMultistatus(body)
+  if (!responses) return { ok: false, error: "The calendar server did not answer with a WebDAV multistatus", events: [] }
+  var events = []
+  for (var i = 0; i < responses.length && events.length < 5000; i++) {
+    var objectHref = boundedString(responses[i].href, 1024)
+    for (var p = 0; p < responses[i].props.length; p++) {
+      var data = xmlFind(responses[i].props[p], "calendar-data")
+      if (!data) continue
+      var vevents = icsComponents(parseIcs(data.text), "VEVENT")
+      var byUid = {}, order = []
+      for (var v = 0; v < vevents.length && v < 500; v++) {
+        var uid = String((icsProp(vevents[v], "UID") || { value: "" }).value || "").trim() || ("#" + v)
+        if (!byUid[uid]) { byUid[uid] = []; order.push(uid) }
+        byUid[uid].push(vevents[v])
+      }
+      for (var u = 0; u < order.length; u++) {
+        var normalizedList = normalizeIcsObject(byUid[order[u]], objectHref + (order.length > 1 ? "#" + u : ""), calendar.id)
+        for (var m = 0; m < normalizedList.length; m++) {
+          var normalized = normalizedList[m]
+          if (normalized.status === "cancelled") continue
+          var occurrences = expandOccurrences(normalized, rangeStartMs, rangeEndMs)
+          for (var o = 0; o < occurrences.length && events.length < 5000; o++) {
+            var occ = occurrences[o]
+            events.push({
+              id: normalized.id + "@" + occ.recurrenceId,
+              masterId: normalized.id,
+              title: occ.title,
+              description: occ.description,
+              location: occ.location,
+              startMs: occ.startMs,
+              endMs: occ.endMs,
+              allDay: normalized.allDay,
+              recurring: occ.recurring,
+              moved: occ.moved,
+              calendarId: calendar.id,
+              calendarName: calendar.name,
+              calendarColor: calendar.color
+            })
+          }
+        }
+      }
+    }
+  }
+  return { ok: true, error: "", events: events }
+}
+
+// The whole window: every calendar's response, in one pass. A rejected
+// credential anywhere is an auth failure for the window; any other
+// per-calendar failure is reported as a warning while the rest still show.
+function parseCalendarWindow(raw, rangeStartMs, rangeEndMs, calendarsById) {
+  var split = parseWindowResponses(raw)
+  if (!split.ok) return { ok: false, error: split.error, code: split.code, events: [] }
+  var byId = calendarsById && typeof calendarsById === "object" ? calendarsById : {}
+  var events = []
+  var warnings = []
+  for (var i = 0; i < split.responses.length; i++) {
+    var response = split.responses[i]
+    var calendar = byId[response.href] || { id: response.href, name: calendarNameFromHref(response.href), color: "" }
+    if (response.status === 0) { warnings.push(calendar.name + ": " + response.error); continue }
+    if (response.status === 401 || response.status === 403)
+      return { ok: false, error: httpFailure(response.status).error, code: "auth", events: [] }
+    if (response.status !== 207 && response.status !== 200) { warnings.push(calendar.name + ": HTTP " + response.status); continue }
+    var parsed = parseCalendarObjects(response.body, calendar, rangeStartMs, rangeEndMs)
+    if (!parsed.ok) { warnings.push(calendar.name + ": " + parsed.error); continue }
+    for (var e = 0; e < parsed.events.length && events.length < 5000; e++) events.push(parsed.events[e])
+  }
+  events.sort(function(a, b) { return a.startMs - b.startMs })
+  return { ok: true, error: warnings.length > 0 ? cleanText(warnings.join(" · "), remoteErrorCharacterLimit) : "", code: "", events: events }
+}
+
+// ---------------------------------------------------------------------------
+// Setup: a floating terminal that asks for the server (Fastmail by default),
+// username and app password, checks them against the server before storing
+// anything, then stores the password via secret-tool's own stdin with the
+// server and username as attributes on the same keyring item. Structure
+// (lock dir, EXIT trap, IPC completion callback) adapted from
+// omarchy-fastmail's Model.js; see THIRD_PARTY_NOTICES.md.
 // ---------------------------------------------------------------------------
 
 var setupLockDirectoryName = "setup-lock"
@@ -707,221 +1429,64 @@ function setupLockCheckCommand() {
   return ["bash", "-c", setupLockShell + "exec 9<\"$lock\"; flock -n 9"]
 }
 
-// The token-capture script itself: instructions, a hidden `read`, a
-// character-class check, one verification call against Fastmail's session
-// endpoint (confirms the token is live and has calendars access before it is
-// ever persisted), then secret-tool store fed the token over its own stdin.
-var setupTokenScript = "set -eu; clear 2>/dev/null || true; "
-  + "printf '%s\\n' 'Fastmail Calendar setup' '' "
-  + "'1. Open " + fastmailApiTokenSettingsUrl + "' "
-  + "'2. Create a new API token with Calendars (read-only) access.' "
-  + "'3. Paste it below — it goes straight to your system keyring,' "
-  + "'   never into this repo, a log file, or your shell history.' ''; "
-  + "printf '%s' 'Fastmail API token: '; "
-  + "stty -echo 2>/dev/null || true; IFS= read -r token; stty echo 2>/dev/null || true; printf '\\n'; "
-  + "token=$(printf '%s' \"$token\" | tr -d '[:space:]'); "
-  + "if [ -z \"$token\" ]; then printf '%s\\n' 'No token entered.'; exit 1; fi; "
-  + "case \"$token\" in *[!A-Za-z0-9._-]*) printf '%s\\n' 'That token has unexpected characters — copy it exactly, with nothing extra.'; exit 1;; esac; "
-  + "printf '%s\\n' 'Checking the token against Fastmail…'; "
-  + "cfg=$(printf 'header = \"Authorization: Bearer %s\"\\n' \"$token\"); "
-  + "resp=$(printf '%s' \"$cfg\" | curl -sS --max-time 20 -K - " + shellQuote(fastmailSessionUrl) + "); "
-  + "case \"$resp\" in *urn:ietf:params:jmap:calendars*) : ;; *) printf '%s\\n' 'That token could not reach Fastmail Calendars — check its scope and try again.'; exit 1;; esac; "
-  + "printf '%s' \"$token\" | secret-tool store --label='Fastmail Calendar API token' service " + shellQuote(secretService) + " account " + shellQuote(secretAccount) + "; "
-  + "unset token; "
+// The credential-capture script: instructions, three prompts (the password
+// one echo-off), input checks, one PROPFIND against the server following
+// its redirects by hand (https only, five at most) so a 401 is caught before
+// anything is persisted, then `secret-tool clear` + `store` fed the
+// password over stdin. The server URL and username are attributes, i.e.
+// secret-tool arguments — they are not secrets.
+var setupCredentialsScript = "set -eu; clear 2>/dev/null || true; "
+  + "printf '%s\\n' 'Calendar setup (CalDAV)' '' "
+  + "'Works with Fastmail and any other CalDAV server.' '' "
+  + "'Fastmail: Settings > Privacy & Security > Integrations > App passwords,' "
+  + "'  New app password, with access limited to Calendars (CalDAV).' "
+  + "'  " + fastmailAppPasswordHelpUrl + "' '' "
+  + "'The password goes straight to your system keyring — never into this repo,' "
+  + "'a log file, or your shell history.' ''; "
+  + "printf '%s' 'Server URL [" + defaultServerUrl + "]: '; IFS= read -r server; "
+  + "server=$(printf '%s' \"$server\" | tr -d '[:space:]'); server=${server:-" + defaultServerUrl + "}; server=${server%/}; "
+  + "case \"$server\" in https://*) : ;; *) printf '%s\\n' 'The server URL must start with https://'; exit 1;; esac; "
+  + "case \"$server\" in *[\\\"\\'\\\\\\`\\<\\>]*|*[[:cntrl:]]*) printf '%s\\n' 'That server URL has unexpected characters.'; exit 1;; esac; "
+  + "printf '%s' 'Username (usually your email address): '; IFS= read -r username; "
+  + "username=$(printf '%s' \"$username\" | tr -d '[:space:]'); "
+  + "if [ -z \"$username\" ]; then printf '%s\\n' 'No username entered.'; exit 1; fi; "
+  + "printf '%s' 'App password: '; "
+  + "stty -echo 2>/dev/null || true; IFS= read -r password; stty echo 2>/dev/null || true; printf '\\n'; "
+  + "if [ -z \"$password\" ]; then printf '%s\\n' 'No password entered.'; exit 1; fi; "
+  + "case \"$username$password\" in *[[:cntrl:]]*) printf '%s\\n' 'That has unexpected control characters.'; exit 1;; esac; "
+  + "esc() { printf '%s' \"$1\" | sed 's/[\\\\\"]/\\\\&/g'; }; "
+  + "cfg=$(printf 'user = \"%s:%s\"\\n' \"$(esc \"$username\")\" \"$(esc \"$password\")\"); "
+  + "probe() { url=$1; n=0; while :; do "
+  + "out=$(printf '%s\\n' \"$cfg\" | curl -sS --max-time 20 --proto =https --max-redirs 0 -K - -o /dev/null -w '%{http_code} %{redirect_url}' -X PROPFIND -H 'Depth: 0' \"$url\") || { printf '%s\\n' \"Could not reach $url\"; exit 1; }; "
+  + "code=${out%% *}; redirect=${out#* }; "
+  + "case \"$code\" in 301|302|303|307|308) "
+  + "case \"$redirect\" in https://*) : ;; *) printf '%s\\n' 'The server redirected somewhere that is not https.'; exit 1;; esac; "
+  + "n=$((n + 1)); if [ \"$n\" -gt " + maxDiscoveryRedirects + " ]; then printf '%s\\n' 'Too many redirects.'; exit 1; fi; url=$redirect; continue;; esac; break; done; }; "
+  + "printf '%s\\n' 'Checking the server…'; "
+  + "case \"$server\" in https://*/*) probe \"$server\";; *) probe \"$server/.well-known/caldav\"; case \"$code\" in 404|405) probe \"$server/\";; esac;; esac; "
+  + "case \"$code\" in 2??) : ;; 401|403) printf '%s\\n' 'The server rejected that username and password.'; exit 1;; "
+  + "*) printf '%s\\n' \"The server answered HTTP $code — check the server URL.\"; exit 1;; esac; "
+  + "secret-tool clear service " + shellQuote(secretService) + " account " + shellQuote(secretAccount) + " 2>/dev/null || true; "
+  + "printf '%s' \"$password\" | secret-tool store --label='Fastmail Calendar (CalDAV) app password' service " + shellQuote(secretService) + " account " + shellQuote(secretAccount) + " server \"$server\" username \"$username\"; "
+  + "unset password cfg; "
   + "printf '%s\\n' '' 'Saved. You can close this window.'"
 
 function setupLaunchCommand(ipcTarget) {
   var target = shellQuote(ipcTarget)
   var completion = "omarchy-shell -q \"$target\" setupFinished"
   return "target=" + target + "; " + setupLockShell
-    + "( flock -n 9 || { printf '%s\\n' 'Fastmail Calendar setup is already running.'; exit 75; }; "
+    + "( flock -n 9 || { printf '%s\\n' 'Calendar setup is already running.'; exit 75; }; "
     + "trap 'exit 129' HUP; trap 'exit 130' INT; trap 'exit 143' TERM; "
     + "trap 'rc=$?; trap - EXIT; flock -u 9; " + completion + "; exit $rc' EXIT; "
-    + setupTokenScript + " ) 9<\"$lock\""
+    + setupCredentialsScript + " ) 9<\"$lock\""
 }
 
-function setupPlan(hasToken, authenticated) {
+function setupPlan(hasCredentials, authenticated) {
   return {
-    needed: hasToken !== true || authenticated !== true,
-    title: hasToken === true ? "Your stored Fastmail token could not sign in" : "Connect your Fastmail calendars",
-    buttonLabel: hasToken === true ? "Reconnect Fastmail…" : "Connect Fastmail…"
+    needed: hasCredentials !== true || authenticated !== true,
+    title: hasCredentials === true ? "Your stored calendar credentials could not sign in" : "Connect a calendar — Fastmail, or any CalDAV server",
+    buttonLabel: hasCredentials === true ? "Reconnect…" : "Connect calendar…"
   }
-}
-
-// ---------------------------------------------------------------------------
-// JMAP request bodies
-// ---------------------------------------------------------------------------
-
-function sessionRequestCommand() {
-  return jmapRequestCommand("GET", fastmailSessionUrl, "")
-}
-
-function parseSession(raw) {
-  var result = parseJson(raw)
-  if (!result.ok) return { ok: false, error: result.error, code: result.code, apiUrl: "", accountId: "" }
-  var value = result.value
-  var primary = value.primaryAccounts && typeof value.primaryAccounts === "object" ? value.primaryAccounts : {}
-  var accountId = boundedString(primary[calendarsCapability] || "", remoteIdCharacterLimit)
-  var apiUrl = boundedString(value.apiUrl || "", 2048)
-  if (accountId === "" || apiUrl === "")
-    return { ok: false, error: "This Fastmail token does not have calendar access", code: "auth", apiUrl: "", accountId: "" }
-  return { ok: true, error: "", code: "", apiUrl: apiUrl, accountId: accountId }
-}
-
-function calendarGetRequestBody(accountId) {
-  return JSON.stringify({
-    using: [coreCapability, calendarsCapability],
-    methodCalls: [["Calendar/get", { accountId: accountId, ids: null }, "c0"]]
-  })
-}
-
-function calendarGetCommand(apiUrl, accountId) {
-  return jmapRequestCommand("POST", apiUrl, calendarGetRequestBody(accountId))
-}
-
-function parseCalendarGet(raw) {
-  var result = parseJson(raw)
-  if (!result.ok) return { ok: false, error: result.error, code: result.code, calendars: [] }
-  var responses = Array.isArray(result.value.methodResponses) ? result.value.methodResponses : []
-  var payload = responses.length > 0 && responses[0][0] === "Calendar/get" ? responses[0][1] : null
-  if (!payload) return { ok: false, error: "Fastmail did not return any calendars", code: "", calendars: [] }
-  var list = Array.isArray(payload.list) ? payload.list : []
-  var calendars = []
-  for (var i = 0; i < list.length && calendars.length < 128; i++) {
-    var entry = list[i] || {}
-    var id = boundedString(entry.id || "", remoteIdCharacterLimit)
-    if (id === "") continue
-    calendars.push({
-      id: id,
-      name: cleanText(entry.name || "Calendar", remoteNameCharacterLimit),
-      color: cleanText(entry.color || "", 32),
-      sortOrder: Number(entry.sortOrder || 0),
-      isOwner: entry.isOwnedByAccount !== false
-    })
-  }
-  calendars.sort(function(a, b) { return a.sortOrder - b.sortOrder || a.name.localeCompare(b.name) })
-  return { ok: true, error: "", code: "", calendars: calendars }
-}
-
-// One combined request: query the events overlapping the window (server-side
-// filter on `after`/`before`), then fetch the full objects for whatever
-// matched via a JMAP back-reference (`#ids`) — a single round trip, per
-// RFC 8620 §3.7. `after`/`before` are UTC instants (Z-suffixed) — JMAP's
-// CalendarEvent/query filter reads both in absolute time, not the event's
-// own zone, so the window itself needs no timezone handling; only the
-// events it returns do (see expandOccurrences above).
-function calendarEventWindowRequestBody(accountId, calendarIds, afterIso, beforeIso) {
-  return JSON.stringify({
-    using: [coreCapability, calendarsCapability],
-    methodCalls: [
-      ["CalendarEvent/query", {
-        accountId: accountId,
-        filter: { inCalendars: calendarIds, after: afterIso, before: beforeIso },
-        limit: 2000
-      }, "q0"],
-      ["CalendarEvent/get", {
-        accountId: accountId,
-        "#ids": { resultOf: "q0", name: "CalendarEvent/query", path: "/ids" }
-      }, "e0"]
-    ]
-  })
-}
-
-function calendarEventWindowCommand(apiUrl, accountId, calendarIds, afterIso, beforeIso) {
-  return jmapRequestCommand("POST", apiUrl, calendarEventWindowRequestBody(accountId, calendarIds, afterIso, beforeIso))
-}
-
-function normalizeCalendarEvent(raw) {
-  var value = raw && typeof raw === "object" ? raw : {}
-  var id = boundedString(value.id || "", remoteIdCharacterLimit)
-  if (id === "") return null
-  var allDay = value.showWithoutTime === true
-  var start = boundedString(value.start || "", 32)
-  if (start === "") return null
-  var calendarIds = value.calendarIds && typeof value.calendarIds === "object" ? Object.keys(value.calendarIds) : []
-  var overrides = {}
-  if (value.recurrenceOverrides && typeof value.recurrenceOverrides === "object") {
-    var keys = Object.keys(value.recurrenceOverrides)
-    for (var i = 0; i < keys.length && i < 2000; i++) {
-      var patch = value.recurrenceOverrides[keys[i]] || {}
-      overrides[keys[i]] = {
-        excluded: patch.excluded === true,
-        start: patch.start !== undefined ? boundedString(patch.start, 32) : undefined,
-        title: patch.title !== undefined ? cleanText(patch.title, remoteTitleCharacterLimit) : undefined,
-        description: patch.description !== undefined ? cleanText(patch.description, remoteExcerptCharacterLimit) : undefined,
-        location: patch.location !== undefined ? cleanText(locationText(patch.locations), remoteNameCharacterLimit) : undefined,
-        durationMs: patch.duration !== undefined ? parseIso8601Duration(patch.duration) : undefined
-      }
-    }
-  }
-  return {
-    id: id,
-    uid: boundedString(value.uid || id, remoteIdCharacterLimit),
-    title: cleanText(value.title || "Untitled event", remoteTitleCharacterLimit),
-    description: cleanText(value.description || "", remoteExcerptCharacterLimit),
-    location: cleanText(locationText(value.locations), remoteNameCharacterLimit),
-    allDay: allDay,
-    startLocal: start,
-    timeZone: allDay ? "" : boundedString(value.timeZone || "", 64),
-    durationMs: parseIso8601Duration(value.duration),
-    recurrenceRules: Array.isArray(value.recurrenceRules) ? value.recurrenceRules : null,
-    recurrenceOverrides: overrides,
-    calendarId: calendarIds.length > 0 ? boundedString(calendarIds[0], remoteIdCharacterLimit) : "",
-    status: boundedString(value.status || "confirmed", 32)
-  }
-}
-
-function locationText(locations) {
-  if (!locations || typeof locations !== "object") return ""
-  var keys = Object.keys(locations)
-  for (var i = 0; i < keys.length; i++) {
-    var loc = locations[keys[i]]
-    if (loc && typeof loc === "object" && loc.name) return String(loc.name)
-  }
-  return ""
-}
-
-// Parses the CalendarEvent/get half of the combined window request and
-// expands every returned master into its occurrences inside
-// [rangeStartMs, rangeEndMs), attaching each instance's calendar (name,
-// color) from `calendarsById` for display, and dropping cancelled events.
-function parseCalendarEventWindow(raw, rangeStartMs, rangeEndMs, calendarsById) {
-  var result = parseJson(raw)
-  if (!result.ok) return { ok: false, error: result.error, code: result.code, events: [] }
-  var responses = Array.isArray(result.value.methodResponses) ? result.value.methodResponses : []
-  var payload = null
-  for (var i = 0; i < responses.length; i++) if (responses[i][0] === "CalendarEvent/get") { payload = responses[i][1]; break }
-  if (!payload) return { ok: false, error: "Fastmail did not return any events", code: "", events: [] }
-  var list = Array.isArray(payload.list) ? payload.list : []
-  var byId = calendarsById && typeof calendarsById === "object" ? calendarsById : {}
-  var events = []
-
-  for (var m = 0; m < list.length && m < 2000; m++) {
-    var normalized = normalizeCalendarEvent(list[m])
-    if (!normalized || normalized.status === "cancelled") continue
-    var calendar = byId[normalized.calendarId] || null
-    var occurrences = expandOccurrences(normalized, rangeStartMs, rangeEndMs)
-    for (var o = 0; o < occurrences.length && events.length < 5000; o++) {
-      var occ = occurrences[o]
-      events.push({
-        id: normalized.id + (occ.recurrenceId !== undefined ? "@" + occ.recurrenceId : ""),
-        masterId: normalized.id,
-        title: occ.title,
-        description: occ.description,
-        location: occ.location,
-        startMs: occ.startMs,
-        endMs: occ.endMs,
-        allDay: normalized.allDay,
-        recurring: occ.recurring,
-        moved: occ.moved,
-        calendarId: normalized.calendarId,
-        calendarName: calendar ? calendar.name : "",
-        calendarColor: calendar ? calendar.color : ""
-      })
-    }
-  }
-  events.sort(function(a, b) { return a.startMs - b.startMs })
-  return { ok: true, error: "", code: "", events: events }
 }
 
 // ---------------------------------------------------------------------------
@@ -1100,18 +1665,27 @@ if (typeof module !== "undefined") {
     boundedCaptureCommand: boundedCaptureCommand, shellQuote: shellQuote,
     cliResponseByteLimit: cliResponseByteLimit, cliErrorByteLimit: cliErrorByteLimit,
     parseJson: parseJson, parseFailure: parseFailure, isAuthError: isAuthError,
-    isNoTokenError: isNoTokenError, isMissingToolError: isMissingToolError,
-    secretService: secretService, secretAccount: secretAccount,
-    validToken: validToken, tokenCharacterPattern: tokenCharacterPattern,
-    fastmailSessionUrl: fastmailSessionUrl, fastmailApiTokenSettingsUrl: fastmailApiTokenSettingsUrl,
+    isNoCredentialsError: isNoCredentialsError, isMissingToolError: isMissingToolError,
+    secretService: secretService, secretAccount: secretAccount, defaultServerUrl: defaultServerUrl,
+    fastmailAppPasswordHelpUrl: fastmailAppPasswordHelpUrl, maxDiscoveryRedirects: maxDiscoveryRedirects,
+    validServerUrl: validServerUrl, serverOrigin: serverOrigin, serverPath: serverPath,
+    discoveryStartUrl: discoveryStartUrl, resolveHref: resolveHref,
     secretLookupCommand: secretLookupCommand, secretClearCommand: secretClearCommand,
-    jmapRequestShell: jmapRequestShell, jmapRequestCommand: jmapRequestCommand, probeCommand: probeCommand,
+    accountInfoShell: accountInfoShell, accountInfoCommand: accountInfoCommand, parseAccountInfo: parseAccountInfo,
+    caldavCredentialShell: caldavCredentialShell, caldavRequestShell: caldavRequestShell, caldavRequestCommand: caldavRequestCommand,
+    caldavWindowShell: caldavWindowShell, caldavWindowCommand: caldavWindowCommand, windowResponseByteLimit: windowResponseByteLimit,
+    parseHttpResponse: parseHttpResponse, isRedirectStatus: isRedirectStatus, httpFailure: httpFailure, parseWindowResponses: parseWindowResponses,
+    decodeXmlEntities: decodeXmlEntities, parseXml: parseXml, xmlChildren: xmlChildren, xmlFind: xmlFind, xmlText: xmlText,
+    propfindDiscoveryBody: propfindDiscoveryBody, propfindCalendarsBody: propfindCalendarsBody,
+    utcStamp: utcStamp, calendarQueryBody: calendarQueryBody,
+    parseMultistatus: parseMultistatus, parseDiscovery: parseDiscovery, normalizeCalendarColor: normalizeCalendarColor,
+    parseCalendarList: parseCalendarList,
+    unfoldIcs: unfoldIcs, icsUnescape: icsUnescape, parseIcsLine: parseIcsLine, parseIcs: parseIcs,
+    icsComponents: icsComponents, normalizeTzid: normalizeTzid, icsDateValue: icsDateValue, localKeyInZone: localKeyInZone,
+    parseRrule: parseRrule, normalizeIcsObject: normalizeIcsObject, normalizeIcsEvent: normalizeIcsEvent,
+    parseCalendarObjects: parseCalendarObjects, parseCalendarWindow: parseCalendarWindow,
     setupLockCheckCommand: setupLockCheckCommand, setupLaunchCommand: setupLaunchCommand,
-    setupTokenScript: setupTokenScript, setupPlan: setupPlan,
-    sessionRequestCommand: sessionRequestCommand, parseSession: parseSession,
-    calendarGetCommand: calendarGetCommand, calendarGetRequestBody: calendarGetRequestBody, parseCalendarGet: parseCalendarGet,
-    calendarEventWindowCommand: calendarEventWindowCommand, calendarEventWindowRequestBody: calendarEventWindowRequestBody,
-    normalizeCalendarEvent: normalizeCalendarEvent, parseCalendarEventWindow: parseCalendarEventWindow,
+    setupCredentialsScript: setupCredentialsScript, setupPlan: setupPlan,
     eventStartKey: eventStartKey, eventsByDay: eventsByDay, eventsOnDay: eventsOnDay,
     eventTimeLabel: eventTimeLabel, eventTimeRangeLabel: eventTimeRangeLabel, nextEventLabel: nextEventLabel,
     calendarColorIndex: calendarColorIndex, fallbackCalendarColor: fallbackCalendarColor, calendarColorPalette: calendarColorPalette,

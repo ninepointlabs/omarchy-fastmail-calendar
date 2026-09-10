@@ -1,9 +1,21 @@
 # Fastmail Calendar for Omarchy
 
 A read-only native Omarchy calendar — Today, Week, Month and Year views, with
-a day detail for events — backed directly by Fastmail's JMAP API. No
-external CLI, no mail, no journal: this plugin only ever reads your Fastmail
-calendars and shows them.
+a day detail for events — backed by CalDAV. Fastmail is the default and the
+reason it exists, but **any CalDAV server works**: Nextcloud, Radicale,
+Baïkal, iCloud, Google (via its CalDAV endpoint), a self-hosted DAViCal —
+anything that speaks RFC 4791. No external CLI, no mail, no journal: this
+plugin only ever reads your calendars and shows them.
+
+## Why CalDAV and not Fastmail's API
+
+Fastmail exposes mail, contacts and masked email over JMAP, to API tokens
+and to OAuth clients alike, but **not calendars** — there is no calendar
+scope on either credential type, and Fastmail's own developer docs say to
+use CalDAV until the JMAP Calendars spec is finalized. So this plugin speaks
+CalDAV with a Fastmail **app password** scoped to calendars only, which is
+exactly what every other third-party calendar client does. The upside is
+that the same code reads any other CalDAV server too.
 
 ## What it does
 
@@ -12,23 +24,29 @@ calendars and shows them.
   (itself modeled on the native Omarchy calendar popup): a grid that never
   resizes between months, ISO week numbers, a day-detail overlay opened by
   clicking any day.
-- **Every calendar on your account**, each independently shown or hidden,
-  with its own color and an optional display name override — your choices
-  persist by the calendar's own stable id, so they survive Fastmail
-  reordering or renaming a calendar.
-- **Recurring events**, expanded client-side from Fastmail's JSCalendar
-  recurrence rules: daily/weekly/monthly/yearly, with `interval`, `count`,
-  `until`, `byDay` (including "2nd Tuesday"-style rules) and `byMonthDay`.
-  Exceptions and moved/retitled instances (`recurrenceOverrides`) are
-  honored. `byYearDay`, `byWeekNo`, `bySetPosition` and sub-hourly
-  frequencies are out of scope — an event using one of those still shows its
-  first occurrence, just not every occurrence.
-- **Correct times across zones and DST.** Fastmail's JMAP calendar events
-  carry a local time plus an IANA time zone name, not a fixed offset; this
-  plugin converts that pair to an absolute instant through the platform's own
-  time zone database (via `Intl`), so a recurring 9am meeting reads as 9am
-  both before and after a DST change, in whatever zone it was scheduled in.
-  All-day events are read from their date alone, never shifted by a zone.
+- **Every calendar on your account**, discovered per RFC 6764
+  (`/.well-known/caldav` → principal → calendar home), each independently
+  shown or hidden, with its own color (read from the server when it
+  publishes one) and an optional display name override — your choices
+  persist by the calendar's own path, so they survive the server reordering
+  or renaming a calendar. Task-only collections and scheduling in/outboxes
+  are skipped.
+- **Recurring events**, expanded client-side from the iCalendar `RRULE`:
+  daily/weekly/monthly/yearly, with `INTERVAL`, `COUNT`, `UNTIL`, `BYDAY`
+  (including "2nd Tuesday" and "last Friday" forms), `BYMONTHDAY` and
+  `BYMONTH`. `EXDATE` exceptions and `RECURRENCE-ID` instances (moved,
+  retitled, or cancelled occurrences) are honored. `BYSETPOS`, `BYYEARDAY`,
+  `BYWEEKNO`, `RDATE`, `RANGE=THISANDFUTURE` and sub-daily frequencies are
+  out of scope — an event using one of those still shows on its own start
+  and whatever the rest of its rule yields, just not every occurrence.
+- **Correct times across zones and DST.** iCalendar events carry a local
+  time plus a `TZID`, not a fixed offset; this plugin converts that pair to
+  an absolute instant through the platform's own time zone database (via
+  `Intl`), so a recurring 9am meeting reads as 9am both before and after a
+  DST change, in whatever zone it was scheduled in. A `TZID` the platform
+  does not know (Windows-style names such as "Central Standard Time") is
+  read as a floating time, i.e. as typed, in your zone. All-day events are
+  read from their date alone, never shifted by a zone.
 - **The bar chip** shows today's date, or (by default) your next event today.
   Right-click cycles the date format; middle-click refreshes.
 
@@ -40,29 +58,40 @@ There is no add/edit/delete for events, and no journal — this is a viewer.
 omarchy plugin add https://github.com/ninepointlabs/omarchy-fastmail-calendar.git --enable
 ```
 
-Click the calendar chip in the bar. **Connect Fastmail…** opens a floating
-terminal that asks for a **Fastmail API token**:
+Click the calendar chip in the bar. **Connect calendar…** opens a floating
+terminal that asks for three things:
 
-1. In Fastmail, go to **Settings → Password & Security → Integrations → API
-   tokens** and create a new token with **Calendars (read-only)** access.
-2. Paste it into the terminal when asked. Input is hidden as you type.
-3. The terminal checks the token against Fastmail before storing anything;
-   if it can't reach your calendars it says so and nothing is saved.
-4. On success the token goes straight into your system keyring via
-   `secret-tool` (libsecret) and the terminal closes.
+1. **Server URL** — press Enter for Fastmail (`https://caldav.fastmail.com`),
+   or type another server. A bare `https://host` is bootstrapped through
+   `/.well-known/caldav`; a URL with a path (say
+   `https://cloud.example.org/remote.php/dav`) is used as the starting point
+   as given. Only `https://` is accepted.
+2. **Username** — usually your email address.
+3. **App password** — hidden as you type. For Fastmail: **Settings →
+   Privacy & Security → Integrations → App passwords → New app password**,
+   and limit its access to **Calendars (CalDAV)**. See Fastmail's
+   [App passwords](https://www.fastmail.help/hc/en-us/articles/360058752854-App-passwords)
+   help page. Other servers have their own equivalent (Nextcloud calls them
+   app passwords too; iCloud calls them app-specific passwords).
 
-The token lives under this plugin's own keyring entry
-(`service=ninepointlabs.fastmail-calendar account=api-token`) — it is not
+The terminal checks the credentials against the server before storing
+anything; if the server rejects them (or is not reachable) it says so and
+nothing is saved. On success the password goes straight into your system
+keyring via `secret-tool` (libsecret), with the server URL and username as
+attributes on the same keyring entry, and the terminal closes.
+
+The credentials live under this plugin's own keyring entry
+(`service=ninepointlabs.fastmail-calendar account=caldav`) — they are not
 shared with, or read from, any other tool on this machine, including
-Hermes's own Fastmail OAuth cache. Only one setup runs at a time; a second
-click while one is in progress is refused rather than opening a second
-terminal.
+`fm-cli`'s own app password or Hermes's Fastmail OAuth cache. Only one setup
+runs at a time; a second click while one is in progress is refused rather
+than opening a second terminal.
 
 **Calendars** in the panel (the calendar icon, or press `C`) lists every
 calendar on the account with a visibility toggle, a color swatch picker, and
-an optional display-name field. **Forget Fastmail token** at the bottom
-removes the stored token (`secret-tool clear`); the plugin then asks you to
-connect again next time you open it.
+an optional display-name field. **Forget calendar credentials** at the
+bottom removes the stored entry (`secret-tool clear`); the plugin then asks
+you to connect again next time you open it.
 
 ## Keys
 
@@ -80,40 +109,63 @@ With the panel open:
 
 ## Security
 
-This plugin never runs a mail or calendar CLI: it talks to
-`https://api.fastmail.com/jmap/session` and the JMAP API endpoint it returns,
-over HTTPS, through `curl` — as a bounded child process, output-size- and
-time-capped, the same as every other Ninepoint Labs Omarchy plugin.
+This plugin never runs a mail or calendar CLI: it talks CalDAV over HTTPS
+through `curl` — as a bounded child process, output-size- and time-capped,
+the same as every other Ninepoint Labs Omarchy plugin.
 
-- The API token is never a command-line argument, never written to a file,
+- The password is never a command-line argument, never written to a file,
   and never logged. It travels `secret-tool lookup` → a shell variable → a
-  `curl -K -` (config supplied on stdin) `Authorization` header, inside one
-  short-lived process; a lookup failure or a token containing anything
-  outside `A-Za-z0-9._-` refuses the request rather than risk it leaking or
-  breaking the header it's interpolated into.
-- The setup terminal's `read` for the token is echo-off and the token is
-  never assembled into a command line, so it never reaches shell history.
-- Every value Fastmail returns — titles, descriptions, locations, calendar
-  names — is treated as untrusted plaintext: bounded in size, control/bidi/
-  zero-width characters stripped, and always rendered as plain text, never
-  HTML.
-- Calendar ids from the account are only ever compared and stored, never
-  interpolated into a shell string.
+  `curl -K -` (config supplied on stdin) `user =` line, inside one
+  short-lived process; a lookup failure, or a stored value containing a
+  control character, refuses the request rather than risk it breaking the
+  config line it is interpolated into. Backslashes and double quotes are
+  escaped for curl's config parser, so any other character is fine.
+- `curl` runs with `--proto =https` and `--max-redirs 0`: only HTTPS is
+  ever used, and redirects are followed by this plugin's own code (five at
+  most, HTTPS only), so the credentials are never replayed to a host the
+  plugin did not vet. Hrefs the server returns are reduced to paths on the
+  configured origin; any href on another origin is ignored.
+- The setup terminal's `read` for the password is echo-off and the password
+  is never assembled into a command line, so it never reaches shell
+  history. The server URL and username are passed to `secret-tool store` as
+  arguments (they are attributes, not secrets).
+- Every value the server returns — titles, descriptions, locations,
+  calendar names, XML, iCalendar — is treated as untrusted plaintext:
+  bounded in size, control/bidi/zero-width characters stripped, and always
+  rendered as plain text, never HTML. The XML reader never expands entities
+  beyond the five predefined ones and numeric references, so DOCTYPE tricks
+  do nothing.
+- Calendar paths from the account are only ever compared, stored, and
+  passed to `curl` as argv, never interpolated into a shell string.
 - `omarchy plugin remove` deletes the checkout and the plugin's saved
-  settings in `shell.json`, but not the keyring entry. Use **Forget Fastmail
-  token** first, or `secret-tool clear service ninepointlabs.fastmail-calendar
-  account api-token`, to remove the credential itself.
+  settings in `shell.json`, but not the keyring entry. Use **Forget
+  calendar credentials** first, or `secret-tool clear service
+  ninepointlabs.fastmail-calendar account caldav`, to remove the credential
+  itself.
 
 For reviewers, this is everything the plugin executes:
 
 ```text
-secret-tool lookup service ninepointlabs.fastmail-calendar account api-token
-curl -K - https://api.fastmail.com/jmap/session                 (probe / session)
-curl -K - -X POST <apiUrl>                                       (Calendar/get, CalendarEvent/query+get)
-secret-tool store  service ninepointlabs.fastmail-calendar account api-token   (setup, in a floating terminal)
-secret-tool clear  service ninepointlabs.fastmail-calendar account api-token   (Forget Fastmail token)
+secret-tool search  service ninepointlabs.fastmail-calendar account caldav   (attributes only: server, username)
+secret-tool lookup  service ninepointlabs.fastmail-calendar account caldav   (the password, inside the request script)
+curl -K - -X PROPFIND -H 'Depth: 0' <start url | principal>                 (discovery)
+curl -K - -X PROPFIND -H 'Depth: 1' <calendar home>                         (calendar list)
+curl -K - -X REPORT   -H 'Depth: 1' <each calendar>                         (calendar-query for the visible window)
+secret-tool clear  service ninepointlabs.fastmail-calendar account caldav   (setup, and Forget calendar credentials)
+secret-tool store  service ninepointlabs.fastmail-calendar account caldav server <url> username <name>   (setup, in a floating terminal)
 omarchy-launch-floating-terminal-with-presentation '<setup script, quoted>'
 ```
+
+## Tested servers
+
+- **Fastmail** — the default. Discovery goes `/.well-known/caldav` →
+  `/dav/calendars` → `/dav/principals/user/<you>/` →
+  `/dav/calendars/user/<you>/`; calendar colors and order come through
+  Apple's `calendar-color` / `calendar-order` properties.
+
+Other servers follow the same RFC 6764/4791 path and are expected to work;
+if yours does not, the panel's status line shows which step failed (HTTP
+status and address). Reports welcome.
 
 ## Demo and tests
 
@@ -121,12 +173,13 @@ omarchy-launch-floating-terminal-with-presentation '<setup script, quoted>'
 node --test tests/model.test.cjs
 ```
 
-Pure JS: date/grid math, timezone-safe recurrence expansion, JMAP request/
-response handling and calendar preference persistence. There is no
-Quickshell/QML test harness in this checkout yet — the QML files follow the
-same structure as `omarchy-hey-calendar`'s (itself exercised by that
-project's `qmltestrunner` suite) but have not been run under a live
-Quickshell shell in this environment.
+Pure JS: date/grid math, timezone-safe recurrence expansion, CalDAV
+discovery and request framing, WebDAV multistatus and iCalendar parsing
+(including `EXDATE`/`RECURRENCE-ID` handling across a real DST change), the
+credential/setup scripts' shape, and calendar preference persistence. There
+is no Quickshell/QML test harness in this checkout yet — the QML files
+follow the same structure as `omarchy-hey-calendar`'s and are lint-clean
+under `qmllint`, but exercising them needs a live Omarchy shell.
 
 ## Updating and removal
 

@@ -19,6 +19,6 @@ The setup flow's lock-directory/floating-terminal/IPC-completion structure
 `Model.js`, and the matching `setupFinished` IPC handler in `BarWidget.qml`)
 is adapted from Ninepoint Labs' `omarchy-fastmail` plugin (MIT License,
 Copyright (c) 2026 Ninepoint Labs), reused with attribution under the terms
-of that license. This plugin's own setup flow captures a Fastmail API token
-directly rather than driving `fm-cli`'s OAuth login — the two plugins share
-no runtime dependency and no credential.
+of that license. This plugin's own setup flow captures a CalDAV app
+password directly rather than driving `fm-cli`'s OAuth login — the two
+plugins share no runtime dependency and no credential.

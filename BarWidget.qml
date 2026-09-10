@@ -111,7 +111,7 @@ BarWidget {
     function hide(): void { root.close() }
     function toggle(): void { root.togglePanel() }
     // Called back by the floating setup terminal's completion trap once the
-    // token-capture script exits, success or cancel either way, so the
+    // credential-capture script exits, success or cancel either way, so the
     // panel's setup state and "setup running" lock re-check immediately
     // rather than waiting for the next 3s poll.
     function setupFinished(): string {
