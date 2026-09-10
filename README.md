@@ -56,7 +56,10 @@ that the same code reads any other CalDAV server too.
   earlier than the start means the next day; an end equal to the start
   means an hour.
 - **The bar chip** shows today's date, or (by default) your next event today.
-  Right-click cycles the date format; middle-click refreshes.
+  Right-click cycles the date format; middle-click refreshes. **Show time in
+  bar** (in the widget's bar settings) adds the current time, 12-hour like
+  the panel's event labels or 24-hour via **Time format**; it follows the
+  date, or leads the next event when that is what the chip is showing.
 
 There is no edit or delete for events yet, and no journal.
 
