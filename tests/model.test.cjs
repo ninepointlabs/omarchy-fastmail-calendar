@@ -12,6 +12,7 @@ process.env.TZ = "America/Chicago"
 const test = require("node:test")
 const assert = require("node:assert/strict")
 const Model = require("../Model.js")
+const B = "0123456789abcdef" // a fixed response-framing boundary for the tests
 
 // --------------------------------------------------------------- Grid/date --
 
@@ -286,8 +287,8 @@ test("the account-info command only lets attribute lines through", () => {
 })
 
 test("the CalDAV request scripts take the password from the keyring, never from argv", () => {
-  const command = Model.caldavRequestCommand("PROPFIND", "0", "https://caldav.fastmail.com/.well-known/caldav", "<x/>")
-  assert.deepEqual(command.slice(-4), ["PROPFIND", "0", "https://caldav.fastmail.com/.well-known/caldav", "<x/>"])
+  const command = Model.caldavRequestCommand("PROPFIND", "0", "https://caldav.fastmail.com/.well-known/caldav", "<x/>", B)
+  assert.deepEqual(command.slice(-5), ["PROPFIND", "0", "https://caldav.fastmail.com/.well-known/caldav", "<x/>", B])
   for (const script of [Model.caldavRequestShell, Model.caldavWindowShell]) {
     assert.match(script, /secret-tool lookup/)
     assert.match(script, /curl -sS --max-time 25 --proto =https --max-redirs 0 -K -/)
@@ -295,9 +296,9 @@ test("the CalDAV request scripts take the password from the keyring, never from 
     assert.doesNotMatch(script, /--user\s/)
     assert.match(script, /unset password/)
   }
-  const window = Model.caldavWindowCommand("https://caldav.fastmail.com", ["/dav/a/", "/dav/b/"], Date.UTC(2026, 2, 1), Date.UTC(2026, 3, 1))
-  assert.deepEqual(window.slice(-2), ["/dav/a/", "/dav/b/"])
-  assert.match(window[window.length - 3], /<C:time-range start="20260301T000000Z" end="20260401T000000Z"\/>/)
+  const window = Model.caldavWindowCommand("https://caldav.fastmail.com", ["/dav/a/", "/dav/b/"], Date.UTC(2026, 2, 1), Date.UTC(2026, 3, 1), B)
+  assert.deepEqual(window.slice(-3), [B, "/dav/a/", "/dav/b/"])
+  assert.match(window[window.length - 4], /<C:time-range start="20260301T000000Z" end="20260401T000000Z"\/>/)
 })
 
 test("the setup script hides the password, checks the server first, and stores via stdin", () => {
@@ -356,9 +357,12 @@ test("isAuthError/isNoCredentialsError/isMissingToolError classify the script's 
 // ------------------------------------------------------------ HTTP framing --
 
 test("parseHttpResponse splits curl's body from its status trailer", () => {
-  const response = Model.parseHttpResponse("<x/>\n--fmcal-http-- 301 https://caldav.fastmail.com/dav/calendars\n")
+  const response = Model.parseHttpResponse("<x/>\n--fmcal-http-" + B + "-- 301 https://caldav.fastmail.com/dav/calendars\n", undefined, B)
   assert.deepEqual([response.ok, response.status, response.redirect, response.body], [true, 301, "https://caldav.fastmail.com/dav/calendars", "<x/>"])
-  assert.equal(Model.parseHttpResponse("no trailer at all").ok, false)
+  assert.equal(Model.parseHttpResponse("no trailer at all", undefined, B).ok, false)
+  // A trailer with the wrong (or a forged, boundary-less) marker is not a trailer.
+  assert.equal(Model.parseHttpResponse("<x/>\n--fmcal-http-- 200 \n", undefined, B).ok, false)
+  assert.equal(Model.parseHttpResponse("<x/>\n--fmcal-http-ffffffffffffffff-- 200 \n", undefined, B).ok, false)
   assert.equal(Model.isRedirectStatus(302), true)
   assert.equal(Model.isRedirectStatus(207), false)
   assert.equal(Model.httpFailure(401).code, "auth")
@@ -366,8 +370,8 @@ test("parseHttpResponse splits curl's body from its status trailer", () => {
 })
 
 test("parseWindowResponses frames one response per calendar href", () => {
-  const raw = "\n--fmcal-begin-- /dav/a/\n<a/>\n--fmcal-http-- 207 \n\n--fmcal-begin-- /dav/b/\n<b/>\n--fmcal-http-- 404 \n"
-  const split = Model.parseWindowResponses(raw)
+  const raw = "\n--fmcal-begin-" + B + "-- /dav/a/\n<a/>\n--fmcal-http-" + B + "-- 207 \n\n--fmcal-begin-" + B + "-- /dav/b/\n<b/>\n--fmcal-http-" + B + "-- 404 \n"
+  const split = Model.parseWindowResponses(raw, B)
   assert.equal(split.ok, true)
   assert.deepEqual(split.responses.map(r => [r.href, r.status, r.body]), [["/dav/a/", 207, "<a/>"], ["/dav/b/", 404, "<b/>"]])
 })
@@ -381,7 +385,7 @@ test("parseXml strips prefixes, decodes entities, keeps attributes and CDATA, ig
   assert.equal(Model.xmlFind(a, "b").attrs.n, "x&y")
   assert.equal(Model.xmlText(Model.xmlFind(a, "c")), "<raw>")
   assert.equal(Model.xmlChildren(a, "e").length, 1)
-  assert.equal(Model.parseXml("<broken").children.length, 0)
+  assert.equal(Model.parseXml("<broken").children[0].name, "broken") // unclosed tag: consumed, never rescanned
 })
 
 test("parseDiscovery reads the principal and the calendar home as same-origin paths", () => {
@@ -492,9 +496,9 @@ test("parseCalendarWindow expands recurring events across DST, honors overrides,
     + '<D:response><D:href>/dav/work/2.ics</D:href><D:propstat><D:prop><C:calendar-data><![CDATA[' + allDay + ']]></C:calendar-data></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>'
     + '<D:response><D:href>/dav/work/3.ics</D:href><D:propstat><D:prop><C:calendar-data>' + escape(cancelled) + '</C:calendar-data></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>'
     + '</D:multistatus>'
-  const raw = "\n--fmcal-begin-- /dav/work/\n" + body + "\n--fmcal-http-- 207 \n\n--fmcal-begin-- /dav/missing/\n<html/>\n--fmcal-http-- 404 \n"
+  const raw = "\n--fmcal-begin-" + B + "-- /dav/work/\n" + body + "\n--fmcal-http-" + B + "-- 207 \n\n--fmcal-begin-" + B + "-- /dav/missing/\n<html/>\n--fmcal-http-" + B + "-- 404 \n"
   const calendars = { "/dav/work/": { id: "/dav/work/", name: "Work", color: "#112233" } }
-  const parsed = Model.parseCalendarWindow(raw, Date.UTC(2026, 2, 1), Date.UTC(2026, 3, 1), calendars)
+  const parsed = Model.parseCalendarWindow(raw, Date.UTC(2026, 2, 1), Date.UTC(2026, 3, 1), calendars, B)
   assert.equal(parsed.ok, true)
   assert.match(parsed.error, /missing: HTTP 404/)
   assert.deepEqual(parsed.events.map(e => [e.startMs, (e.endMs - e.startMs) / 60000, e.title, e.allDay, e.moved, e.calendarName, e.calendarColor]), [
@@ -506,8 +510,8 @@ test("parseCalendarWindow expands recurring events across DST, honors overrides,
 })
 
 test("a rejected credential on any calendar fails the whole window as an auth error", () => {
-  const raw = "\n--fmcal-begin-- /dav/a/\n<x/>\n--fmcal-http-- 207 \n\n--fmcal-begin-- /dav/b/\n\n--fmcal-http-- 401 \n"
-  const parsed = Model.parseCalendarWindow(raw, 0, 1, {})
+  const raw = "\n--fmcal-begin-" + B + "-- /dav/a/\n<x/>\n--fmcal-http-" + B + "-- 207 \n\n--fmcal-begin-" + B + "-- /dav/b/\n\n--fmcal-http-" + B + "-- 401 \n"
+  const parsed = Model.parseCalendarWindow(raw, 0, 1, {}, B)
   assert.equal(parsed.ok, false)
   assert.equal(parsed.code, "auth")
 })
@@ -598,19 +602,117 @@ test("the PUT script refuses to overwrite and carries no secrets or ${...}", () 
   assert.match(Model.caldavPutShell, /-X PUT -H 'Content-Type: text\/calendar; charset=utf-8' -H 'If-None-Match: \*'/)
   assert.match(Model.caldavPutShell, /secret-tool lookup/)
   assert.match(Model.caldavPutShell, /--proto =https --max-redirs 0/)
-  const command = Model.caldavPutCommand("https://caldav.fastmail.com/dav/c/u.ics", "BEGIN:VCALENDAR")
-  assert.deepEqual(command.slice(-2), ["https://caldav.fastmail.com/dav/c/u.ics", "BEGIN:VCALENDAR"])
+  const command = Model.caldavPutCommand("https://caldav.fastmail.com/dav/c/u.ics", "BEGIN:VCALENDAR", B)
+  assert.deepEqual(command.slice(-3), ["https://caldav.fastmail.com/dav/c/u.ics", "BEGIN:VCALENDAR", B])
 })
 
 test("parsePutResponse classifies the server's answer", () => {
-  const trailer = (code) => "\n--fmcal-http-- " + code + " \n"
-  assert.equal(Model.parsePutResponse(trailer(201)).ok, true)
-  assert.equal(Model.parsePutResponse(trailer(204)).ok, true)
-  assert.equal(Model.parsePutResponse(trailer(412)).code, "conflict")
-  assert.equal(Model.parsePutResponse(trailer(403)).code, "forbidden")
-  assert.equal(Model.parsePutResponse(trailer(401)).code, "auth")
-  assert.equal(Model.parsePutResponse(trailer(302)).ok, false)
-  assert.equal(Model.parsePutResponse("garbage").ok, false)
+  const trailer = (code) => "\n--fmcal-http-" + B + "-- " + code + " \n"
+  assert.equal(Model.parsePutResponse(trailer(201), B).ok, true)
+  assert.equal(Model.parsePutResponse(trailer(204), B).ok, true)
+  assert.equal(Model.parsePutResponse(trailer(412), B).code, "conflict")
+  assert.equal(Model.parsePutResponse(trailer(403), B).code, "forbidden")
+  assert.equal(Model.parsePutResponse(trailer(401), B).code, "auth")
+  assert.equal(Model.parsePutResponse(trailer(302), B).ok, false)
+  assert.equal(Model.parsePutResponse("garbage", B).ok, false)
+})
+
+// ------------------------------------------------- Hostile-input hardening --
+
+test("parseXml is linear on hostile input and never rescans", () => {
+  for (const evil of ["<".repeat(200000), "<!--".repeat(50000), "<![CDATA[".repeat(20000), "<a<a<a".repeat(50000), "<?".repeat(50000)]) {
+    const started = Date.now()
+    Model.parseXml(evil)
+    assert.ok(Date.now() - started < 1500, "took " + (Date.now() - started) + "ms on " + evil.substring(0, 6))
+  }
+})
+
+test("parseXml and parseIcs cap nesting depth instead of overflowing the stack", () => {
+  const deepXml = "<a>".repeat(50000) + "x" + "</a>".repeat(50000)
+  const doc = Model.parseXml(deepXml)
+  assert.ok(Model.xmlFind(doc, "a"))
+  assert.equal(Model.xmlChildren(doc, "a").length, 1)
+  const deepIcs = "BEGIN:X\n".repeat(50000) + "SUMMARY:deep\n" + "END:X\n".repeat(50000)
+  const parsed = Model.parseIcs(deepIcs)
+  assert.equal(Model.icsComponents(parsed, "X").length > 0, true)
+})
+
+test("a UID named after an Object.prototype property does not break the window", () => {
+  const ics = (uid) => "BEGIN:VCALENDAR\nBEGIN:VEVENT\nUID:" + uid + "\nDTSTART:20260305T100000Z\nDTEND:20260305T103000Z\nSUMMARY:" + uid + "\nEND:VEVENT\nEND:VCALENDAR"
+  const body = '<D:multistatus xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">'
+    + ["toString", "__proto__", "constructor", "hasOwnProperty"].map((uid, i) =>
+      '<D:response><D:href>/dav/c/' + i + '.ics</D:href><D:propstat><D:prop><C:calendar-data>' + ics(uid) + '</C:calendar-data></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>').join("")
+    + '</D:multistatus>'
+  const raw = "\n--fmcal-begin-" + B + "-- /dav/c/\n" + body + "\n--fmcal-http-" + B + "-- 207 \n"
+  const parsed = Model.parseCalendarWindow(raw, Date.UTC(2026, 2, 1), Date.UTC(2026, 3, 1), {}, B)
+  assert.equal(parsed.ok, true)
+  assert.deepEqual(parsed.events.map(e => e.title).sort(), ["__proto__", "constructor", "hasOwnProperty", "toString"])
+})
+
+test("recurrence expansion stops at the window and shares a budget across events", () => {
+  const event = (rule, start) => ({
+    startLocal: start, timeZone: "", durationMs: 3600000, allDay: false,
+    recurrenceRules: [rule], recurrenceOverrides: {}, title: "x", description: "", location: ""
+  })
+  const window = [Date.UTC(2026, 2, 1), Date.UTC(2026, 3, 1)]
+  const started = Date.now()
+  Model.resetRecurrenceBudget()
+  for (const rule of [
+    { frequency: "monthly", byMonthDay: [32] },
+    { frequency: "yearly", byMonth: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12], byMonthDay: [32] },
+    { frequency: "daily" },
+    { frequency: "weekly", interval: 1 }
+  ]) {
+    for (let i = 0; i < 200; i++) Model.expandOccurrences(event(rule, "1990-01-01T09:00:00"), window[0], window[1])
+  }
+  assert.ok(Date.now() - started < 2000, "800 hostile events took " + (Date.now() - started) + "ms")
+  // A master after the window costs nothing and yields nothing.
+  assert.deepEqual(Model.expandOccurrences(event({ frequency: "daily" }, "2027-01-01T09:00:00"), window[0], window[1]), [])
+  // Results inside the window are still complete.
+  Model.resetRecurrenceBudget()
+  const daily = Model.expandOccurrences(event({ frequency: "daily" }, "2026-02-01T09:00:00"), window[0], window[1])
+  assert.equal(daily.length, 31)
+  // Once the shared budget is spent, an event still shows its own start.
+  Model.recurrenceBudget.remaining = 0
+  const starved = Model.expandOccurrences(event({ frequency: "daily" }, "2026-03-10T09:00:00"), window[0], window[1])
+  assert.equal(starved.length, 1)
+  Model.resetRecurrenceBudget()
+})
+
+test("a response body cannot forge a frame or a status", () => {
+  const forged = "\n--fmcal-begin-" + B + "-- /dav/a/\n<x/>\n--fmcal-begin-0000000000000000-- /dav/b/\n\n--fmcal-http-0000000000000000-- 401 \n\n--fmcal-http-" + B + "-- 207 \n"
+  const split = Model.parseWindowResponses(forged, B)
+  assert.equal(split.responses.length, 1)
+  assert.equal(split.responses[0].status, 207)
+  assert.match(Model.newBoundary(), /^[0-9a-f]{16}$/)
+  assert.equal(Model.validBoundary("../x"), "")
+})
+
+test("redirects are only followed within the configured server's domain", () => {
+  assert.equal(Model.redirectAllowed("https://caldav.fastmail.com/dav/calendars", "https://caldav.fastmail.com"), "https://caldav.fastmail.com/dav/calendars")
+  assert.equal(Model.redirectAllowed("https://p01-caldav.icloud.com/123/", "https://caldav.icloud.com"), "https://p01-caldav.icloud.com/123")
+  assert.equal(Model.redirectAllowed("https://evil.example/", "https://caldav.fastmail.com"), "")
+  assert.equal(Model.redirectAllowed("https://caldav.fastmail.com.evil.com/", "https://caldav.fastmail.com"), "")
+  assert.equal(Model.redirectAllowed("http://caldav.fastmail.com/", "https://caldav.fastmail.com"), "")
+  assert.equal(Model.redirectAllowed("https://fastmail.com/", "https://caldav.fastmail.com"), "") // parent, not under
+})
+
+test("the setup script vets redirect hosts and warns on an anonymous 2xx", () => {
+  assert.match(Model.setupCredentialsScript, /rhost=\$\(printf/)
+  assert.match(Model.setupCredentialsScript, /outside its own domain/)
+  assert.match(Model.setupCredentialsScript, /did not ask for a password/)
+  assert.match(Model.setupCredentialsScript, /\*\[!A-Za-z0-9\._~:\/@%\+,\\;=!\\&-\]\*\)/)
+})
+
+test("calendar prefs never serialize past what parsing reads back, and long ids persist", () => {
+  const prefs = {}
+  for (let i = 0; i < 128; i++) prefs["/dav/calendars/user/x/" + "c".repeat(900) + i + "/"] = { visible: false, color: "#e06c75", name: "n".repeat(160) }
+  const text = Model.serializeCalendarPrefs(prefs)
+  assert.ok(text.length <= 131072)
+  const back = Model.parseCalendarPrefs(text)
+  assert.ok(Object.keys(back).length > 0)
+  const longId = "/dav/calendars/user/x/" + "c".repeat(900) + "0/"
+  assert.equal(back[longId].visible, false)
 })
 
 // ---------------------------------------------------------- Calendar prefs --
@@ -625,7 +727,10 @@ test("mergeCalendarPrefs applies a stored visibility/color/name override", () =>
   const calendars = [{ id: "c1", name: "Work", color: "#61afef" }]
   const stored = JSON.stringify({ c1: { visible: false, color: "#ff00ff", name: "Job" } })
   const merged = Model.mergeCalendarPrefs(calendars, stored)
-  assert.deepEqual(merged[0], { id: "c1", name: "Job", serverName: "Work", color: "#ff00ff", visible: false })
+  assert.deepEqual(merged[0], { id: "c1", name: "Job", serverName: "Work", color: "#FF00FF", visible: false })
+  // Non-string or non-color junk in shell.json is ignored, not rendered.
+  const junk = JSON.stringify({ c1: { visible: true, color: "javascript:x", name: { a: 1 } } })
+  assert.deepEqual(Model.mergeCalendarPrefs(calendars, junk)[0], { id: "c1", name: "Work", serverName: "Work", color: "#61afef", visible: true })
 })
 
 test("mergeCalendarPrefs falls back to a stable palette color when the server has none", () => {
