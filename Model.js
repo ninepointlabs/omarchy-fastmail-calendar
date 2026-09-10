@@ -1443,12 +1443,18 @@ var setupCredentialsScript = "set -eu; clear 2>/dev/null || true; "
   + "'  " + fastmailAppPasswordHelpUrl + "' '' "
   + "'The password goes straight to your system keyring — never into this repo,' "
   + "'a log file, or your shell history.' ''; "
+  // Terminal query replies (gum's, the emulator's) can be queued on the tty
+  // ahead of anything the user types and would be read as the first answer;
+  // drain them the way omarchy-show-done does, then also strip any CSI/OSC
+  // residue and control characters from what is read.
+  + "while IFS= read -rsn 1 -t 0.2 _; do :; done; "
+  + "strip_term() { sed -E 's/\\x1b\\][^\\x07\\x1b]*(\\x07|\\x1b\\\\)//g; s/\\x1b\\[[0-9;?]*[ -\\/]*[@-~]//g' | tr -d '[:cntrl:]'; }; "
   + "printf '%s' 'Server URL [" + defaultServerUrl + "]: '; IFS= read -r server; "
-  + "server=$(printf '%s' \"$server\" | tr -d '[:space:]'); server=${server:-" + defaultServerUrl + "}; server=${server%/}; "
+  + "server=$(printf '%s' \"$server\" | strip_term | tr -d '[:space:]'); server=${server:-" + defaultServerUrl + "}; server=${server%/}; "
   + "case \"$server\" in https://*) : ;; *) printf '%s\\n' 'The server URL must start with https://'; exit 1;; esac; "
   + "case \"$server\" in *[\\\"\\'\\\\\\`\\<\\>]*|*[[:cntrl:]]*) printf '%s\\n' 'That server URL has unexpected characters.'; exit 1;; esac; "
   + "printf '%s' 'Username (usually your email address): '; IFS= read -r username; "
-  + "username=$(printf '%s' \"$username\" | tr -d '[:space:]'); "
+  + "username=$(printf '%s' \"$username\" | strip_term | tr -d '[:space:]'); "
   + "if [ -z \"$username\" ]; then printf '%s\\n' 'No username entered.'; exit 1; fi; "
   + "printf '%s' 'App password: '; "
   + "stty -echo 2>/dev/null || true; IFS= read -r password; stty echo 2>/dev/null || true; printf '\\n'; "
