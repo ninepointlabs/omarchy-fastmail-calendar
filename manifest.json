@@ -1,0 +1,53 @@
+{
+  "schemaVersion": 1,
+  "id": "ninepointlabs.fastmail-calendar",
+  "name": "Fastmail Calendar",
+  "version": "0.1.0",
+  "author": "Ninepoint Labs",
+  "license": "MIT",
+  "description": "Read-only native Omarchy calendar — Today, Week, Month and Year views with day detail — backed directly by Fastmail's JMAP API.",
+  "kinds": [
+    "service",
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "service": "Service.qml",
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Fastmail Calendar",
+    "description": "Today's date or next event from Fastmail, with a Today/Week/Month/Year calendar panel and read-only day detail.",
+    "category": "Time",
+    "aliases": [
+      "calendar",
+      "fastmail calendar",
+      "agenda"
+    ],
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "view": "month",
+      "showNextEvent": true
+    },
+    "schema": [
+      {
+        "key": "showNextEvent",
+        "type": "boolean",
+        "label": "Show next event in bar",
+        "defaultValue": true
+      },
+      {
+        "key": "view",
+        "type": "enum",
+        "label": "Default view",
+        "options": [
+          "today",
+          "week",
+          "month",
+          "year"
+        ],
+        "defaultValue": "month"
+      }
+    ]
+  }
+}
