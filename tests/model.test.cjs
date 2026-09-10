@@ -529,6 +529,90 @@ test("request bodies are well-formed and ask for exactly what the parsers read",
   assert.match(Model.calendarQueryBody(0, 86400000), /<C:comp-filter name="VEVENT"><C:time-range start="19700101T000000Z" end="19700102T000000Z"\/>/)
 })
 
+// ------------------------------------------------------------- Add event --
+
+test("normalizeTimeOfDay reads times the way people type them", () => {
+  assert.deepEqual(["9", "9:30", "9.30pm", "12am", "12pm", "21:30", "0:15", "9 PM"].map(Model.normalizeTimeOfDay),
+    ["09:00", "09:30", "21:30", "00:00", "12:00", "21:30", "00:15", "21:00"])
+  assert.deepEqual(["24", "9:60", "noon", "13pm", ""].map(Model.normalizeTimeOfDay), ["", "", "", "", ""])
+})
+
+test("icsEscapeText and icsFoldLine follow RFC 5545", () => {
+  assert.equal(Model.icsEscapeText("a;b,c\\d\nx"), "a\\;b\\,c\\\\d\\nx")
+  const folded = Model.icsFoldLine("SUMMARY:" + "é".repeat(60))
+  for (const line of folded.split("\r\n")) assert.ok(Buffer.byteLength(line, "utf8") <= 75)
+  assert.equal(folded.split("\r\n").length, 2)
+  assert.equal(folded.replace(/\r\n /g, ""), "SUMMARY:" + "é".repeat(60))
+  assert.equal(Model.icsFoldLine("short"), "short")
+})
+
+test("prepareNewEvent writes a timed event as UTC instants resolved in the viewer's zone", () => {
+  const event = Model.prepareNewEvent({
+    title: "Dentist, downtown; bring card", dateKey: "2026-09-15", allDay: false, startTime: "9am", endTime: "10",
+    location: "Tyler", description: "Line 1\nLine 2", calendarId: "/dav/calendars/user/x/work/",
+    uid: "uid-1@ninepointlabs.fastmail-calendar", nowMs: Date.UTC(2026, 8, 10, 15)
+  })
+  assert.equal(event.ok, true, event.error)
+  assert.equal(event.href, "/dav/calendars/user/x/work/uid-1@ninepointlabs.fastmail-calendar.ics")
+  const lines = event.body.split("\r\n")
+  assert.equal(lines[0], "BEGIN:VCALENDAR")
+  assert.ok(lines.includes("DTSTART:20260915T140000Z")) // 9am CDT
+  assert.ok(lines.includes("DTEND:20260915T150000Z"))
+  assert.ok(lines.includes("SUMMARY:Dentist\\, downtown\\; bring card"))
+  assert.ok(lines.includes("LOCATION:Tyler"))
+  assert.ok(lines.includes("DESCRIPTION:Line 1\\nLine 2"))
+  assert.ok(lines.includes("DTSTAMP:20260910T150000Z"))
+  assert.equal(lines[lines.length - 2], "END:VCALENDAR")
+  assert.equal(lines[lines.length - 1], "")
+  assert.equal(event.startMs, Date.UTC(2026, 8, 15, 14))
+})
+
+test("prepareNewEvent writes an all-day event as DATE values ending the next day", () => {
+  const event = Model.prepareNewEvent({ title: "Trip", dateKey: "2026-09-15", allDay: true, calendarId: "/dav/c/", uid: "u2" })
+  assert.equal(event.ok, true)
+  const lines = event.body.split("\r\n")
+  assert.ok(lines.includes("DTSTART;VALUE=DATE:20260915"))
+  assert.ok(lines.includes("DTEND;VALUE=DATE:20260916"))
+  assert.ok(!lines.some(l => l.startsWith("LOCATION")))
+})
+
+test("prepareNewEvent reads an end before the start as next day, and equal as one hour", () => {
+  const late = Model.prepareNewEvent({ title: "Late", dateKey: "2026-09-15", startTime: "22:00", endTime: "1:00", calendarId: "/dav/c/", uid: "u3" })
+  assert.equal(late.endMs - late.startMs, 3 * 3600000)
+  const same = Model.prepareNewEvent({ title: "Same", dateKey: "2026-09-15", startTime: "9", endTime: "9", calendarId: "/dav/c/", uid: "u4" })
+  assert.equal(same.endMs - same.startMs, 3600000)
+  const blank = Model.prepareNewEvent({ title: "Blank end", dateKey: "2026-09-15", startTime: "9", endTime: "", calendarId: "/dav/c/", uid: "u5" })
+  assert.equal(blank.endMs - blank.startMs, 3600000)
+})
+
+test("prepareNewEvent refuses unusable input with a reason", () => {
+  assert.match(Model.prepareNewEvent({ title: " ", dateKey: "2026-09-15", startTime: "9", calendarId: "/dav/c/" }).error, /title/)
+  assert.match(Model.prepareNewEvent({ title: "x", dateKey: "2026-09-15", startTime: "25", calendarId: "/dav/c/" }).error, /Start time/)
+  assert.match(Model.prepareNewEvent({ title: "x", dateKey: "2026-09-15", startTime: "9", calendarId: "not-a-path" }).error, /calendar/)
+  assert.match(Model.prepareNewEvent({ title: "x", dateKey: "2026-09-15", startTime: "9", calendarId: "/dav/c/file.ics" }).error, /calendar/)
+  assert.match(Model.prepareNewEvent({ title: "x", dateKey: "nope", startTime: "9", calendarId: "/dav/c/" }).error, /date/)
+  assert.match(Model.generateUid(), /^[0-9a-f]+-[0-9a-f]{32}@ninepointlabs\.fastmail-calendar$/)
+})
+
+test("the PUT script refuses to overwrite and carries no secrets or ${...}", () => {
+  assert.match(Model.caldavPutShell, /-X PUT -H 'Content-Type: text\/calendar; charset=utf-8' -H 'If-None-Match: \*'/)
+  assert.match(Model.caldavPutShell, /secret-tool lookup/)
+  assert.match(Model.caldavPutShell, /--proto =https --max-redirs 0/)
+  const command = Model.caldavPutCommand("https://caldav.fastmail.com/dav/c/u.ics", "BEGIN:VCALENDAR")
+  assert.deepEqual(command.slice(-2), ["https://caldav.fastmail.com/dav/c/u.ics", "BEGIN:VCALENDAR"])
+})
+
+test("parsePutResponse classifies the server's answer", () => {
+  const trailer = (code) => "\n--fmcal-http-- " + code + " \n"
+  assert.equal(Model.parsePutResponse(trailer(201)).ok, true)
+  assert.equal(Model.parsePutResponse(trailer(204)).ok, true)
+  assert.equal(Model.parsePutResponse(trailer(412)).code, "conflict")
+  assert.equal(Model.parsePutResponse(trailer(403)).code, "forbidden")
+  assert.equal(Model.parsePutResponse(trailer(401)).code, "auth")
+  assert.equal(Model.parsePutResponse(trailer(302)).ok, false)
+  assert.equal(Model.parsePutResponse("garbage").ok, false)
+})
+
 // ---------------------------------------------------------- Calendar prefs --
 
 test("mergeCalendarPrefs defaults to visible with the server color", () => {

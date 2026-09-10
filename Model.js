@@ -728,9 +728,9 @@ var caldavCredentialShell = ""
   + "cfg=$(printf 'user = \"%s:%s\"\\n' \"$(esc \"$username\")\" \"$(esc \"$password\")\"); "
   + "unset password; "
 
-var curlCommon = "curl -sS --max-time 25 --proto =https --max-redirs 0 -K - "
-  + "-H 'Content-Type: application/xml; charset=utf-8' "
+var curlBase = "curl -sS --max-time 25 --proto =https --max-redirs 0 -K - "
   + "-w '\\n--fmcal-http-- %{http_code} %{redirect_url}\\n'"
+var curlCommon = curlBase + " -H 'Content-Type: application/xml; charset=utf-8'"
 var networkFailure = "{ printf '%s' '{\"ok\":false,\"error\":\"Could not reach the calendar server\",\"code\":\"network\"}' >&2; exit 1; }"
 
 // One request: method, Depth header, URL and XML body as positional args
@@ -804,6 +804,155 @@ function parseWindowResponses(raw) {
     responses.push({ href: href, status: response.ok ? response.status : 0, body: response.ok ? response.body : "", error: response.ok ? "" : response.error })
   }
   return { ok: true, error: "", code: "", responses: responses }
+}
+
+// Creating an event: one PUT of an iCalendar object at a fresh href inside
+// the calendar collection (RFC 4791 §5.3.2). `If-None-Match: *` makes the
+// server refuse to overwrite anything already there, so a UID collision
+// can never clobber an existing event.
+var caldavPutShell = "url=$1; body=$2; " + caldavCredentialShell
+  + "printf '%s\\n' \"$cfg\" | " + curlBase + " -X PUT -H 'Content-Type: text/calendar; charset=utf-8' -H 'If-None-Match: *' --data-binary \"$body\" \"$url\" || " + networkFailure
+
+function caldavPutCommand(url, body) {
+  return boundedCaptureCommand(["bash", "-c", caldavPutShell, "fmcal-caldav-put", String(url || ""), String(body || "")],
+    cliResponseByteLimit, cliErrorByteLimit)
+}
+
+function parsePutResponse(raw) {
+  var response = parseHttpResponse(raw)
+  if (!response.ok) return { ok: false, error: response.error, code: "" }
+  if (response.status === 201 || response.status === 204 || response.status === 200) return { ok: true, error: "", code: "" }
+  if (response.status === 401) return { ok: false, error: httpFailure(401).error, code: "auth" }
+  if (response.status === 403) return { ok: false, error: "The server would not let this account write to that calendar", code: "forbidden" }
+  if (response.status === 412) return { ok: false, error: "An event with that id already exists — try again", code: "conflict" }
+  if (isRedirectStatus(response.status)) return { ok: false, error: "The server redirected the write; nothing was saved", code: "http" }
+  return { ok: false, error: httpFailure(response.status).error, code: "http" }
+}
+
+// ---------------------------------------------------------------------------
+// New-event input → iCalendar. Times are typed the way people type them
+// ("9", "9:30am", "21:30"); the object is written with UTC instants for a
+// timed event (no VTIMEZONE needed, every server accepts it, and it shows
+// at the right wall-clock time in whatever zone it is later read in) and
+// DATE values for an all-day one.
+// ---------------------------------------------------------------------------
+
+var eventTitleInputLimit = 256
+var eventLocationInputLimit = 160
+var eventDescriptionInputLimit = 2000
+
+// Adapted from omarchy-hey-calendar's Model.js (MIT, Ninepoint Labs).
+function normalizeTimeOfDay(value) {
+  var text = String(value || "").trim().toLowerCase()
+  var match = text.match(/^(\d{1,2})(?:[:.]([0-5]\d))?\s*(am|pm|a|p)?$/)
+  if (!match) return ""
+  var hour = parseInt(match[1], 10)
+  var minute = match[2] !== undefined ? parseInt(match[2], 10) : 0
+  var meridiem = match[3] ? match[3].charAt(0) : ""
+  if (meridiem !== "") {
+    if (hour < 1 || hour > 12) return ""
+    if (meridiem === "a") hour = hour === 12 ? 0 : hour
+    else hour = hour === 12 ? 12 : hour + 12
+  } else if (hour > 23) {
+    return ""
+  }
+  return pad2(hour) + ":" + pad2(minute)
+}
+
+function icsEscapeText(value) {
+  return String(value || "").replace(/\\/g, "\\\\").replace(/;/g, "\\;").replace(/,/g, "\\,").replace(/\r?\n/g, "\\n")
+}
+
+function utf8ByteLength(ch) {
+  var code = ch.codePointAt(0)
+  if (code <= 0x7f) return 1
+  if (code <= 0x7ff) return 2
+  if (code <= 0xffff) return 3
+  return 4
+}
+
+// RFC 5545 §3.1: lines longer than 75 octets are folded with CRLF + space,
+// never splitting a UTF-8 sequence.
+function icsFoldLine(line) {
+  var out = "", current = "", bytes = 0
+  var chars = Array.from(String(line || ""))
+  for (var i = 0; i < chars.length; i++) {
+    var size = utf8ByteLength(chars[i])
+    if (bytes + size > 75 - (out === "" ? 0 : 1)) {
+      out += (out === "" ? "" : "\r\n ") + current
+      current = ""
+      bytes = 0
+    }
+    current += chars[i]
+    bytes += size
+  }
+  return out + (out === "" ? "" : "\r\n ") + current
+}
+
+function icsStamp(ms) {
+  return utcStamp(ms)
+}
+
+function generateUid() {
+  var random = ""
+  for (var i = 0; i < 4; i++) random += ("00000000" + Math.floor(Math.random() * 0x100000000).toString(16)).slice(-8)
+  return Date.now().toString(16) + "-" + random + "@ninepointlabs.fastmail-calendar"
+}
+
+// Validates the form input and builds the object to PUT. `fields`:
+// { title, dateKey, allDay, startTime, endTime, location, description,
+//   calendarId, uid?, nowMs? }. Timed events resolve the date + "HH:MM" in
+// this machine's zone (what the viewer typed against) to a UTC instant; an
+// end earlier than the start is read as the next day, an end equal to the
+// start becomes an hour.
+function prepareNewEvent(fields) {
+  var input = fields && typeof fields === "object" ? fields : {}
+  var title = cleanText(input.title, eventTitleInputLimit)
+  if (title === "") return { ok: false, error: "Give the event a title", href: "", body: "" }
+  var calendarId = resolveHref(input.calendarId, "")
+  if (calendarId === "" || calendarId.charAt(calendarId.length - 1) !== "/") return { ok: false, error: "Pick a calendar", href: "", body: "" }
+  var date = dateFromKey(input.dateKey)
+  if (!date) return { ok: false, error: "That date is not readable", href: "", body: "" }
+  var uid = boundedString(input.uid || generateUid(), 200)
+  if (!/^[A-Za-z0-9@._-]+$/.test(uid)) return { ok: false, error: "Bad event id", href: "", body: "" }
+  var nowMs = Number(input.nowMs || Date.now())
+
+  var lines = [
+    "BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//Ninepoint Labs//Fastmail Calendar for Omarchy//EN",
+    "BEGIN:VEVENT",
+    "UID:" + uid,
+    "DTSTAMP:" + icsStamp(nowMs),
+    "CREATED:" + icsStamp(nowMs)
+  ]
+  var startMs, endMs
+  if (input.allDay === true) {
+    var next = new Date(date.getFullYear(), date.getMonth(), date.getDate() + 1)
+    lines.push("DTSTART;VALUE=DATE:" + keyForDate(date).replace(/-/g, ""))
+    lines.push("DTEND;VALUE=DATE:" + keyForDate(next).replace(/-/g, ""))
+    startMs = Date.UTC(date.getFullYear(), date.getMonth(), date.getDate())
+    endMs = startMs + MS_PER_DAY
+  } else {
+    var start = normalizeTimeOfDay(input.startTime)
+    var end = normalizeTimeOfDay(input.endTime)
+    if (start === "") return { ok: false, error: "Start time is not readable — 9, 9:30am and 21:30 all work", href: "", body: "" }
+    if (end === "") end = start
+    var startParts = start.split(":"), endParts = end.split(":")
+    startMs = new Date(date.getFullYear(), date.getMonth(), date.getDate(), parseInt(startParts[0], 10), parseInt(startParts[1], 10)).getTime()
+    endMs = new Date(date.getFullYear(), date.getMonth(), date.getDate(), parseInt(endParts[0], 10), parseInt(endParts[1], 10)).getTime()
+    if (endMs < startMs) endMs += MS_PER_DAY
+    if (endMs === startMs) endMs += 3600000
+    lines.push("DTSTART:" + icsStamp(startMs))
+    lines.push("DTEND:" + icsStamp(endMs))
+  }
+  lines.push("SUMMARY:" + icsEscapeText(title))
+  var location = cleanText(input.location, eventLocationInputLimit)
+  if (location !== "") lines.push("LOCATION:" + icsEscapeText(location))
+  var description = boundedString(String(input.description || "").replace(/[\x00-\x08\x0b-\x1f\x7f]/g, "").trim(), eventDescriptionInputLimit)
+  if (description !== "") lines.push("DESCRIPTION:" + icsEscapeText(description))
+  lines.push("END:VEVENT", "END:VCALENDAR")
+
+  var body = lines.map(icsFoldLine).join("\r\n") + "\r\n"
+  return { ok: true, error: "", href: calendarId + uid + ".ics", body: body, uid: uid, startMs: startMs, endMs: endMs }
 }
 
 // ---------------------------------------------------------------------------
@@ -1694,6 +1843,10 @@ if (typeof module !== "undefined") {
     icsComponents: icsComponents, normalizeTzid: normalizeTzid, icsDateValue: icsDateValue, localKeyInZone: localKeyInZone,
     parseRrule: parseRrule, normalizeIcsObject: normalizeIcsObject, normalizeIcsEvent: normalizeIcsEvent,
     parseCalendarObjects: parseCalendarObjects, parseCalendarWindow: parseCalendarWindow,
+    caldavPutShell: caldavPutShell, caldavPutCommand: caldavPutCommand, parsePutResponse: parsePutResponse,
+    normalizeTimeOfDay: normalizeTimeOfDay, icsEscapeText: icsEscapeText, icsFoldLine: icsFoldLine,
+    generateUid: generateUid, prepareNewEvent: prepareNewEvent,
+    eventTitleInputLimit: eventTitleInputLimit, eventLocationInputLimit: eventLocationInputLimit,
     setupLockCheckCommand: setupLockCheckCommand, setupLaunchCommand: setupLaunchCommand,
     setupCredentialsScript: setupCredentialsScript, setupPlan: setupPlan,
     eventStartKey: eventStartKey, eventsByDay: eventsByDay, eventsOnDay: eventsOnDay,
