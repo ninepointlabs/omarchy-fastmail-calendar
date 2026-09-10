@@ -74,6 +74,14 @@ Panel {
   }
   readonly property var visibleEvents: computeVisibleEvents()
 
+  // Calendars the add-event form can write into: the visible ones, by path.
+  readonly property var calendarOptions: {
+    var out = []
+    for (var i = 0; i < calendarPrefs.length; i++)
+      if (calendarPrefs[i].visible) out.push({ value: calendarPrefs[i].id, label: calendarPrefs[i].name })
+    return out
+  }
+
   function computeEventDayKeys() {
     var byDay = Model.eventsByDay(root.visibleEvents)
     var out = ({})
@@ -520,6 +528,8 @@ Panel {
             DayDetail {
               visible: !root.needsSetup && root.currentView === "today"
               width: parent.width
+              service: root.service
+              calendarOptions: root.calendarOptions
               dayDate: root.today
               dateKey: root.todayKey
               events: root.dayEvents(root.todayKey)
@@ -885,6 +895,8 @@ Panel {
           DayDetail {
             id: dayDetailInner
             width: dayDetailFlick.width
+            service: root.service
+            calendarOptions: root.calendarOptions
             dayDate: root.dayDetailDate
             dateKey: root.dayDetailKey
             events: root.dayEvents(root.dayDetailKey)

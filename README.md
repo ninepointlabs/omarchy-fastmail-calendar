@@ -1,11 +1,11 @@
 # Fastmail Calendar for Omarchy
 
-A read-only native Omarchy calendar — Today, Week, Month and Year views, with
-a day detail for events — backed by CalDAV. Fastmail is the default and the
+A native Omarchy calendar — Today, Week, Month and Year views, with a day
+detail for events and a quick add-event form — backed by CalDAV. Fastmail is the default and the
 reason it exists, but **any CalDAV server works**: Nextcloud, Radicale,
 Baïkal, iCloud, Google (via its CalDAV endpoint), a self-hosted DAViCal —
 anything that speaks RFC 4791. No external CLI, no mail, no journal: this
-plugin only ever reads your calendars and shows them.
+plugin reads your calendars, shows them, and can add an event.
 
 ## Why CalDAV and not Fastmail's API
 
@@ -47,10 +47,16 @@ that the same code reads any other CalDAV server too.
   does not know (Windows-style names such as "Central Standard Time") is
   read as a floating time, i.e. as typed, in your zone. All-day events are
   read from their date alone, never shifted by a zone.
+- **Add an event** from any day's detail (or the Today view): title, all-day
+  or a start/end typed the way you'd type it ("9", "9:30am", "21:30"),
+  optional location, and which calendar. It is written as one iCalendar
+  object with `If-None-Match: *`, so it can never overwrite anything. An end
+  earlier than the start means the next day; an end equal to the start
+  means an hour.
 - **The bar chip** shows today's date, or (by default) your next event today.
   Right-click cycles the date format; middle-click refreshes.
 
-There is no add/edit/delete for events, and no journal — this is a viewer.
+There is no edit or delete for events yet, and no journal.
 
 ## Setup
 
@@ -69,7 +75,8 @@ terminal that asks for three things:
 2. **Username** — usually your email address.
 3. **App password** — hidden as you type. For Fastmail: **Settings →
    Privacy & Security → Integrations → App passwords → New app password**,
-   and limit its access to **Calendars (CalDAV)**. See Fastmail's
+   and limit its access to **Calendars (CalDAV)** — that scope is what
+   lets the plugin both read and add events. See Fastmail's
    [App passwords](https://www.fastmail.help/hc/en-us/articles/360058752854-App-passwords)
    help page. Other servers have their own equivalent (Nextcloud calls them
    app passwords too; iCloud calls them app-specific passwords).
@@ -136,7 +143,10 @@ the same as every other Ninepoint Labs Omarchy plugin.
   beyond the five predefined ones and numeric references, so DOCTYPE tricks
   do nothing.
 - Calendar paths from the account are only ever compared, stored, and
-  passed to `curl` as argv, never interpolated into a shell string.
+  passed to `curl` as argv, never interpolated into a shell string. The
+  only write is the add-event `PUT`, to a fresh, plugin-generated href
+  inside the chosen calendar, with `If-None-Match: *` so the server refuses
+  to replace an existing object; nothing is ever updated or deleted.
 - `omarchy plugin remove` deletes the checkout and the plugin's saved
   settings in `shell.json`, but not the keyring entry. Use **Forget
   calendar credentials** first, or `secret-tool clear service
@@ -151,6 +161,7 @@ secret-tool lookup  service ninepointlabs.fastmail-calendar account caldav   (th
 curl -K - -X PROPFIND -H 'Depth: 0' <start url | principal>                 (discovery)
 curl -K - -X PROPFIND -H 'Depth: 1' <calendar home>                         (calendar list)
 curl -K - -X REPORT   -H 'Depth: 1' <each calendar>                         (calendar-query for the visible window)
+curl -K - -X PUT -H 'If-None-Match: *' <calendar>/<new uid>.ics             (Add event — the plugin's only write)
 secret-tool clear  service ninepointlabs.fastmail-calendar account caldav   (setup, and Forget calendar credentials)
 secret-tool store  service ninepointlabs.fastmail-calendar account caldav server <url> username <name>   (setup, in a floating terminal)
 omarchy-launch-floating-terminal-with-presentation '<setup script, quoted>'
@@ -175,8 +186,9 @@ node --test tests/model.test.cjs
 
 Pure JS: date/grid math, timezone-safe recurrence expansion, CalDAV
 discovery and request framing, WebDAV multistatus and iCalendar parsing
-(including `EXDATE`/`RECURRENCE-ID` handling across a real DST change), the
-credential/setup scripts' shape, and calendar preference persistence. There
+(including `EXDATE`/`RECURRENCE-ID` handling across a real DST change),
+iCalendar generation for new events, the credential/setup scripts' shape,
+and calendar preference persistence. There
 is no Quickshell/QML test harness in this checkout yet — the QML files
 follow the same structure as `omarchy-hey-calendar`'s and are lint-clean
 under `qmllint`, but exercising them needs a live Omarchy shell.

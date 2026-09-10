@@ -11,7 +11,8 @@ import "Model.js" as Model
 // reads this one instance, so switching months or opening a day never fires
 // more than one request at a time. Read-only: there is no event mutation
 // here, only CalDAV discovery, the calendar list, and the events in whatever
-// date window the panel asks for.
+// date window the panel asks for — plus one write: creating an event (a
+// single CalDAV PUT, see addEvent below).
 //
 // A refresh runs the RFC 6764 discovery chain step by step, one bounded curl
 // process per step, each parsed here before the next is chosen:
@@ -65,7 +66,11 @@ Item {
   readonly property bool setupChecking: setupLockProcess.running
   property string actionStatus: ""
 
-  readonly property bool busy: probing || windowLoading || forgetProcess.running
+  // ---- Event creation (the one write this plugin does)
+  property bool mutating: false
+  property string mutationError: ""
+
+  readonly property bool busy: probing || windowLoading || forgetProcess.running || mutating
 
   function setting(name, fallback) {
     var value = settings ? settings[name] : undefined
@@ -348,6 +353,58 @@ Item {
         root._windowQueued = false
         root.requestWindow(root.windowStart, root.windowEnd, true)
       }
+    }
+  }
+
+  // ----------------------------------------------------------- Add event --
+
+  // Builds the iCalendar object from the form fields and PUTs it into the
+  // chosen calendar. Returns false (with mutationError set) when the input
+  // is not usable; the request's own outcome lands in mutationError /
+  // actionStatus asynchronously, followed by a window re-fetch on success.
+  function addEvent(fields) {
+    if (!active || mutating) return false
+    if (!authenticated || origin === "") { mutationError = "Connect a calendar first"; return false }
+    var prepared = Model.prepareNewEvent(fields)
+    if (!prepared.ok) { mutationError = prepared.error; return false }
+    mutationError = ""
+    mutating = true
+    _putOut = ""
+    _putErr = ""
+    putProcess.command = Model.caldavPutCommand(origin + prepared.href, prepared.body)
+    putProcess.running = true
+    return true
+  }
+
+  property string _putOut: ""
+  property string _putErr: ""
+
+  Process {
+    id: putProcess
+    running: false
+    command: []
+    stdout: StdioCollector { id: putStdout; waitForEnd: true; onStreamFinished: root._putOut = text }
+    stderr: StdioCollector { id: putStderr; waitForEnd: true; onStreamFinished: root._putErr = text }
+    onExited: function(exitCode) {
+      var stdout = String(putStdout.text || root._putOut || "")
+      var stderr = String(putStderr.text || root._putErr || "")
+      root.mutating = false
+      if (exitCode !== 0) {
+        var failure = Model.parseFailure(stdout, stderr)
+        if (Model.isAuthError(failure.code)) root.authenticated = false
+        root.mutationError = root.conciseError(failure.error, "Could not save the event")
+        return
+      }
+      var result = Model.parsePutResponse(stdout)
+      if (!result.ok) {
+        if (Model.isAuthError(result.code)) root.authenticated = false
+        root.mutationError = root.conciseError(result.error, "Could not save the event")
+        return
+      }
+      root.mutationError = ""
+      root.actionStatus = "Event added"
+      actionStatusTimer.restart()
+      if (root.windowStart !== "" && root.windowEnd !== "") root.requestWindow(root.windowStart, root.windowEnd, true)
     }
   }
 
