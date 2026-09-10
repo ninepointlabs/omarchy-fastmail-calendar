@@ -134,7 +134,8 @@ Item {
     command: Model.accountInfoCommand()
     stdout: StdioCollector { id: accountStdout; waitForEnd: true; onStreamFinished: root._accountOut = text }
     onExited: function(exitCode) {
-      var info = Model.parseAccountInfo(String(accountStdout.text || root._accountOut || ""))
+      var info
+      try { info = Model.parseAccountInfo(String(accountStdout.text || root._accountOut || "")) } catch (error) { info = { server: "", username: "" } }
       if (exitCode !== 0 || info.server === "" || info.username === "") {
         root.server = ""
         root.username = ""
@@ -156,12 +157,14 @@ Item {
   property string _stepUrl: ""
   property string _stepOut: ""
   property string _stepErr: ""
+  property string _stepBoundary: ""
 
   function runStep(method, depth, url, body) {
     _stepUrl = url
     _stepOut = ""
     _stepErr = ""
-    stepProcess.command = Model.caldavRequestCommand(method, depth, url, body)
+    _stepBoundary = Model.newBoundary()
+    stepProcess.command = Model.caldavRequestCommand(method, depth, url, body, _stepBoundary)
     stepProcess.running = true
   }
 
@@ -172,7 +175,12 @@ Item {
     stdout: StdioCollector { id: stepStdout; waitForEnd: true; onStreamFinished: root._stepOut = text }
     stderr: StdioCollector { id: stepStderr; waitForEnd: true; onStreamFinished: root._stepErr = text }
     onExited: function(exitCode) {
-      root.finishStep(exitCode, String(stepStdout.text || root._stepOut || ""), String(stepStderr.text || root._stepErr || ""))
+      // A parser throw must never leave the service stuck "probing".
+      try {
+        root.finishStep(exitCode, String(stepStdout.text || root._stepOut || ""), String(stepStderr.text || root._stepErr || ""))
+      } catch (error) {
+        root.failProbe("Could not read the calendar server's answer", "http")
+      }
     }
   }
 
@@ -182,11 +190,13 @@ Item {
       failProbe(failure.error, failure.code)
       return
     }
-    var response = Model.parseHttpResponse(stdout)
+    var response = Model.parseHttpResponse(stdout, undefined, _stepBoundary)
     if (!response.ok) { failProbe(response.error, "http"); return }
 
     if (Model.isRedirectStatus(response.status)) {
-      var target = Model.validServerUrl(response.redirect)
+      // Only within the configured server's own domain — the credentials
+      // travel with the next request.
+      var target = Model.redirectAllowed(response.redirect, server)
       if (target === "" || _redirects >= Model.maxDiscoveryRedirects) {
         failProbe("The calendar server redirected somewhere this plugin will not follow", "http")
         return
@@ -312,11 +322,13 @@ Item {
     _eventsErr = ""
     _windowRangeStartMs = rangeStartMs
     _windowRangeEndMs = rangeEndMs
-    eventsProcess.command = Model.caldavWindowCommand(origin, hrefs, rangeStartMs, rangeEndMs)
+    _windowBoundary = Model.newBoundary()
+    eventsProcess.command = Model.caldavWindowCommand(origin, hrefs, rangeStartMs, rangeEndMs, _windowBoundary)
     eventsProcess.running = true
   }
 
   property bool _windowQueued: false
+  property string _windowBoundary: ""
   property double _windowRangeStartMs: 0
   property double _windowRangeEndMs: 0
   property string _eventsOut: ""
@@ -340,7 +352,12 @@ Item {
       } else {
         var byId = {}
         for (var i = 0; i < root.calendars.length; i++) byId[root.calendars[i].id] = root.calendars[i]
-        var parsed = Model.parseCalendarWindow(stdout, root._windowRangeStartMs, root._windowRangeEndMs, byId)
+        var parsed
+        try {
+          parsed = Model.parseCalendarWindow(stdout, root._windowRangeStartMs, root._windowRangeEndMs, byId, root._windowBoundary)
+        } catch (error) {
+          parsed = { ok: false, error: "Could not read the events the server returned", code: "", events: [] }
+        }
         if (!parsed.ok) {
           if (Model.isAuthError(parsed.code)) { root.authenticated = false; root.lastError = root.conciseError(parsed.error, ""); return }
           root.windowError = root.conciseError(parsed.error, "Could not load events")
@@ -371,13 +388,15 @@ Item {
     mutating = true
     _putOut = ""
     _putErr = ""
-    putProcess.command = Model.caldavPutCommand(origin + prepared.href, prepared.body)
+    _putBoundary = Model.newBoundary()
+    putProcess.command = Model.caldavPutCommand(origin + prepared.href, prepared.body, _putBoundary)
     putProcess.running = true
     return true
   }
 
   property string _putOut: ""
   property string _putErr: ""
+  property string _putBoundary: ""
 
   Process {
     id: putProcess
@@ -395,7 +414,7 @@ Item {
         root.mutationError = root.conciseError(failure.error, "Could not save the event")
         return
       }
-      var result = Model.parsePutResponse(stdout)
+      var result = Model.parsePutResponse(stdout, root._putBoundary)
       if (!result.ok) {
         if (Model.isAuthError(result.code)) root.authenticated = false
         root.mutationError = root.conciseError(result.error, "Could not save the event")

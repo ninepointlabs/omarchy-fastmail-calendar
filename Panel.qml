@@ -1018,7 +1018,9 @@ Panel {
 
                 TextField {
                   width: parent.width
-                  placeholderText: calendarRow.modelData.serverName + " (display name)"
+                  // A constant: placeholderText renders as AutoText in Qt Quick
+                  // Controls, so server-provided names must never reach it.
+                  placeholderText: "Display name"
                   foreground: root.foreground
                   accent: root.accent
                   maximumLength: Model.remoteNameCharacterLimit

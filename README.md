@@ -131,9 +131,17 @@ the same as every other Ninepoint Labs Omarchy plugin.
   escaped for curl's config parser, so any other character is fine.
 - `curl` runs with `--proto =https` and `--max-redirs 0`: only HTTPS is
   ever used, and redirects are followed by this plugin's own code (five at
-  most, HTTPS only), so the credentials are never replayed to a host the
-  plugin did not vet. Hrefs the server returns are reduced to paths on the
+  most, HTTPS only, and only to the configured server's own host or another
+  host under its domain, e.g. `caldav.icloud.com` → `p01-caldav.icloud.com`),
+  so the credentials are never replayed to a host outside the server you
+  configured. Hrefs the server returns are reduced to paths on the
   configured origin; any href on another origin is ignored.
+- Server responses are parsed by a linear-time XML scanner and iCalendar
+  reader with nesting caps, recurrence expansion is bounded to the visible
+  window with a per-fetch budget, and every parse runs under a guard, so a
+  hostile or broken server can make the panel show an error but cannot
+  hang or wedge the shell. Response framing uses a per-request random
+  boundary so a body cannot forge a status.
 - The setup terminal's `read` for the password is echo-off and the password
   is never assembled into a command line, so it never reaches shell
   history. The server URL and username are passed to `secret-tool store` as

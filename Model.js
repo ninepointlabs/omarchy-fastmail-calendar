@@ -244,6 +244,11 @@ function parseIso8601Duration(value) {
 
 var maxOccurrencesPerEvent = 500
 var maxRecurrenceIterations = 20000
+// One budget shared by every event in a window fetch: once spent, remaining
+// events are shown at their own start only. Reset by parseCalendarWindow.
+var recurrenceBudget = { remaining: 2000000 }
+
+function resetRecurrenceBudget() { recurrenceBudget.remaining = 2000000 }
 
 function addMonthsClamped(year, month, day, deltaMonths) {
   var total = year * 12 + month + deltaMonths
@@ -273,8 +278,9 @@ function nthWeekdayOfMonth(year, month, weekday, nth) {
 // before the requested display window narrows them — bounded by count/until
 // and by the hard iteration/occurrence caps above regardless of what the
 // rule asks for.
-function candidateStarts(rule, start) {
+function candidateStarts(rule, start, rangeEndMs) {
   var frequency = String(rule.frequency || "")
+  var stopAfterMs = typeof rangeEndMs === "number" && isFinite(rangeEndMs) ? rangeEndMs + MS_PER_DAY * 2 : null
   var interval = Math.max(1, parseInt(rule.interval, 10) || 1)
   var count = rule.count !== undefined ? Math.max(0, parseInt(rule.count, 10) || 0) : -1
   var until = rule.until ? parseLocalDateTime(rule.until) : null
@@ -286,9 +292,14 @@ function candidateStarts(rule, start) {
   var out = []
   var iterations = 0
 
+  var passedRange = false
+
   function withinLimits() {
     if (out.length >= maxOccurrencesPerEvent) return false
     if (count >= 0 && out.length >= count) return false
+    if (passedRange) return false
+    if (recurrenceBudget.remaining <= 0) return false
+    recurrenceBudget.remaining--
     return true
   }
 
@@ -296,6 +307,7 @@ function candidateStarts(rule, start) {
     if (!withinLimits()) return
     var localMs = Date.UTC(year, month, day, start.hour, start.minute, start.second)
     if (untilMs !== null && localMs > untilMs) return
+    if (stopAfterMs !== null && localMs > stopAfterMs) { passedRange = true; return }
     out.push({ year: year, month: month, day: day, localMs: localMs })
   }
 
@@ -305,6 +317,8 @@ function candidateStarts(rule, start) {
       iterations++
       var localMs = Date.UTC(cursor.year, cursor.month, cursor.day, start.hour, start.minute, start.second)
       if (untilMs !== null && localMs > untilMs) break
+      if (stopAfterMs !== null && localMs > stopAfterMs) break
+      recurrenceBudget.remaining--
       out.push({ year: cursor.year, month: cursor.month, day: cursor.day, localMs: localMs })
       var next = new Date(Date.UTC(cursor.year, cursor.month, cursor.day + interval))
       cursor = { year: next.getUTCFullYear(), month: next.getUTCMonth(), day: next.getUTCDate() }
@@ -318,6 +332,7 @@ function candidateStarts(rule, start) {
     weekAnchor.setUTCDate(weekAnchor.getUTCDate() - weekAnchor.getUTCDay())
     var week = 0
     while (withinLimits() && iterations < maxRecurrenceIterations) {
+      if (stopAfterMs !== null && weekAnchor.getTime() + week * 7 * MS_PER_DAY > stopAfterMs) break
       if (week % interval === 0) {
         for (var i = 0; i < days.length && withinLimits(); i++) {
           iterations++
@@ -337,6 +352,7 @@ function candidateStarts(rule, start) {
     while (withinLimits() && iterations < maxRecurrenceIterations) {
       iterations++
       var target = addMonthsClamped(start.year, month0, start.day, m * interval)
+      if (stopAfterMs !== null && Date.UTC(target.year, target.month, 1) > stopAfterMs) break
       if (byDay && byDay.length > 0) {
         for (var bd = 0; bd < byDay.length && withinLimits(); bd++) {
           var entry = byDay[bd]
@@ -366,6 +382,7 @@ function candidateStarts(rule, start) {
     while (withinLimits() && iterations < maxRecurrenceIterations) {
       iterations++
       var years = start.year + y * interval
+      if (stopAfterMs !== null && Date.UTC(years, 0, 1) > stopAfterMs) break
       var months = byMonth && byMonth.length > 0 ? byMonth.map(function(mo) { return mo - 1 }) : [start.month - 1]
       for (var mi = 0; mi < months.length && withinLimits(); mi++) {
         if (byMonthDay && byMonthDay.length > 0) {
@@ -402,14 +419,17 @@ function candidateStarts(rule, start) {
 function expandOccurrences(event, rangeStartMs, rangeEndMs) {
   var start = parseLocalDateTime(event.startLocal)
   if (!start) return []
+  // A master that starts after the window (allowing a day of zone slack)
+  // cannot produce anything inside it.
+  if (Date.UTC(start.year, start.month - 1, start.day) > rangeEndMs + MS_PER_DAY) return []
   var durationMs = event.durationMs || 0
-  var overrides = event.recurrenceOverrides && typeof event.recurrenceOverrides === "object" ? event.recurrenceOverrides : {}
+  var overrides = event.recurrenceOverrides && typeof event.recurrenceOverrides === "object" ? event.recurrenceOverrides : Object.create(null)
 
   var bases
   if (Array.isArray(event.recurrenceRules) && event.recurrenceRules.length > 0) {
     bases = []
     for (var r = 0; r < event.recurrenceRules.length && bases.length < maxOccurrencesPerEvent; r++) {
-      bases = bases.concat(candidateStarts(event.recurrenceRules[r], start))
+      bases = bases.concat(candidateStarts(event.recurrenceRules[r], start, rangeEndMs))
     }
     bases.sort(function(a, b) { return a.localMs - b.localMs })
     if (bases.length === 0)
@@ -418,7 +438,7 @@ function expandOccurrences(event, rangeStartMs, rangeEndMs) {
     bases = [{ year: start.year, month: start.month - 1, day: start.day, localMs: Date.UTC(start.year, start.month - 1, start.day, start.hour, start.minute, start.second) }]
   }
 
-  var seen = {}
+  var seen = Object.create(null)
   var out = []
   for (var i = 0; i < bases.length && out.length < maxOccurrencesPerEvent; i++) {
     var base = bases[i]
@@ -635,7 +655,7 @@ var maxDiscoveryRedirects = 5
 // https only, a host (optionally a port), and an optional path made of the
 // characters a URL path can carry minus anything that could break out of a
 // quoting context (quotes, backslashes, whitespace, angle brackets).
-var serverUrlPattern = /^https:\/\/[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?(?::\d{1,5})?(?:\/[A-Za-z0-9._~!$&+,;=:@%\/-]*)?$/
+var serverUrlPattern = /^https:\/\/[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?(?::\d{1,5})?(?:\/[A-Za-z0-9._~!&+,;=:@%\/-]*)?$/
 
 function validServerUrl(value) {
   var url = String(value === undefined || value === null ? "" : value).trim()
@@ -647,6 +667,27 @@ function validServerUrl(value) {
 function serverOrigin(url) {
   var match = String(url || "").match(/^(https:\/\/[^\/]+)/)
   return match ? match[1] : ""
+}
+
+function serverHost(url) {
+  var match = String(url || "").match(/^https:\/\/([^\/:]+)/)
+  return match ? match[1].toLowerCase() : ""
+}
+
+// A redirect may only move within the configured server's own domain: the
+// same host, or another host under its registrable domain (iCloud bounces
+// caldav.icloud.com to pNN-caldav.icloud.com). Anything else would replay
+// the stored credentials to a host the user never configured.
+function redirectAllowed(target, configuredServer) {
+  var url = validServerUrl(target)
+  if (url === "") return ""
+  var to = serverHost(url), from = serverHost(configuredServer)
+  if (to === "" || from === "") return ""
+  if (to === from) return url
+  var labels = from.split(".")
+  if (labels.length < 2) return ""
+  var base = "." + labels.slice(-2).join(".")
+  return to.length > base.length && to.substring(to.length - base.length) === base ? url : ""
 }
 
 function serverPath(url) {
@@ -728,8 +769,11 @@ var caldavCredentialShell = ""
   + "cfg=$(printf 'user = \"%s:%s\"\\n' \"$(esc \"$username\")\" \"$(esc \"$password\")\"); "
   + "unset password; "
 
+// The status trailer and per-calendar frame markers carry a boundary that
+// is generated fresh for every invocation (argv, not secret) so a response
+// body cannot forge a frame or a status.
 var curlBase = "curl -sS --max-time 25 --proto =https --max-redirs 0 -K - "
-  + "-w '\\n--fmcal-http-- %{http_code} %{redirect_url}\\n'"
+  + "-w \"\\\\n--fmcal-http-$boundary-- %{http_code} %{redirect_url}\\\\n\""
 var curlCommon = curlBase + " -H 'Content-Type: application/xml; charset=utf-8'"
 var networkFailure = "{ printf '%s' '{\"ok\":false,\"error\":\"Could not reach the calendar server\",\"code\":\"network\"}' >&2; exit 1; }"
 
@@ -737,27 +781,37 @@ var networkFailure = "{ printf '%s' '{\"ok\":false,\"error\":\"Could not reach t
 // (none of them secret), credentials from the prelude. curl handles no
 // redirects itself — the caller sees the 3xx plus its Location and decides,
 // so the credentials are never replayed to a host this code did not vet.
-var caldavRequestShell = "method=$1; depth=$2; url=$3; body=$4; " + caldavCredentialShell
+var caldavRequestShell = "method=$1; depth=$2; url=$3; body=$4; boundary=$5; " + caldavCredentialShell
   + "printf '%s\\n' \"$cfg\" | " + curlCommon + " -X \"$method\" -H \"Depth: $depth\" --data-binary \"$body\" \"$url\" || " + networkFailure
 
-function caldavRequestCommand(method, depth, url, body, stdoutLimit) {
+function newBoundary() {
+  var out = ""
+  for (var i = 0; i < 2; i++) out += ("00000000" + Math.floor(Math.random() * 0x100000000).toString(16)).slice(-8)
+  return out
+}
+
+function validBoundary(value) {
+  return /^[0-9a-f]{16}$/.test(String(value || "")) ? String(value) : ""
+}
+
+function caldavRequestCommand(method, depth, url, body, boundary, stdoutLimit) {
   return boundedCaptureCommand(
-    ["bash", "-c", caldavRequestShell, "fmcal-caldav", String(method || "PROPFIND"), String(depth || "0"), String(url || ""), String(body || "")],
+    ["bash", "-c", caldavRequestShell, "fmcal-caldav", String(method || "PROPFIND"), String(depth || "0"), String(url || ""), String(body || ""), validBoundary(boundary)],
     stdoutLimit || cliResponseByteLimit, cliErrorByteLimit)
 }
 
 // The window fetch: one calendar-query REPORT per calendar href, all in one
 // process so the keyring is read once, each response framed by a begin line
 // carrying its href and the same status trailer as a single request.
-var caldavWindowShell = "origin=$1; body=$2; shift 2; " + caldavCredentialShell
-  + "for href in \"$@\"; do printf '\\n--fmcal-begin-- %s\\n' \"$href\"; "
+var caldavWindowShell = "origin=$1; body=$2; boundary=$3; shift 3; " + caldavCredentialShell
+  + "for href in \"$@\"; do printf '\\n--fmcal-begin-%s-- %s\\n' \"$boundary\" \"$href\"; "
   + "printf '%s\\n' \"$cfg\" | " + curlCommon + " -X REPORT -H 'Depth: 1' --data-binary \"$body\" \"$origin$href\" || " + networkFailure + "; "
   + "done"
 
 var windowResponseByteLimit = 8 * 1024 * 1024
 
-function caldavWindowCommand(origin, hrefs, startUtcMs, endUtcMs) {
-  var args = ["bash", "-c", caldavWindowShell, "fmcal-caldav-window", String(origin || ""), calendarQueryBody(startUtcMs, endUtcMs)]
+function caldavWindowCommand(origin, hrefs, startUtcMs, endUtcMs, boundary) {
+  var args = ["bash", "-c", caldavWindowShell, "fmcal-caldav-window", String(origin || ""), calendarQueryBody(startUtcMs, endUtcMs), validBoundary(boundary)]
   var list = Array.isArray(hrefs) ? hrefs : []
   for (var i = 0; i < list.length && i < 128; i++) args.push(String(list[i]))
   return boundedCaptureCommand(args, windowResponseByteLimit, cliErrorByteLimit, 90)
@@ -766,14 +820,16 @@ function caldavWindowCommand(origin, hrefs, startUtcMs, endUtcMs) {
 // Splits curl's output into body + status trailer. A missing trailer means
 // the process died before curl could report (or output was cut by the size
 // guard), which is an error rather than a body to parse.
-function parseHttpResponse(raw, byteLimit) {
+function parseHttpResponse(raw, byteLimit, boundary) {
   var text = String(raw || "")
   if (exceedsUtf8ByteLimit(text, byteLimit || cliResponseByteLimit))
     return { ok: false, error: "The calendar server response exceeded its size limit", code: "", status: 0, redirect: "", body: "" }
-  var match = text.match(/\n--fmcal-http-- (\d{3}) (\S*)\n?$/)
+  var marker = "\n--fmcal-http-" + validBoundary(boundary) + "-- "
+  var at = text.lastIndexOf(marker)
+  var match = at >= 0 ? text.substring(at).match(/^\n--fmcal-http-[0-9a-f]*-- (\d{3}) (\S*)\n?$/) : null
   if (!match)
     return { ok: false, error: "The calendar server returned no status", code: "", status: 0, redirect: "", body: "" }
-  return { ok: true, error: "", code: "", status: parseInt(match[1], 10), redirect: boundedString(match[2], 2048), body: text.substring(0, match.index) }
+  return { ok: true, error: "", code: "", status: parseInt(match[1], 10), redirect: boundedString(match[2], 2048), body: text.substring(0, at) }
 }
 
 function isRedirectStatus(status) {
@@ -790,17 +846,17 @@ function httpFailure(status, what) {
   return { error: label + " answered HTTP " + status, code: "http" }
 }
 
-function parseWindowResponses(raw) {
+function parseWindowResponses(raw, boundary) {
   var text = String(raw || "")
   if (exceedsUtf8ByteLimit(text, windowResponseByteLimit))
     return { ok: false, error: "The calendar server response exceeded its size limit", code: "", responses: [] }
-  var segments = text.split("\n--fmcal-begin-- ")
+  var segments = text.split("\n--fmcal-begin-" + validBoundary(boundary) + "-- ")
   var responses = []
   for (var i = 1; i < segments.length && i <= 128; i++) {
     var newline = segments[i].indexOf("\n")
     if (newline < 0) continue
     var href = boundedString(segments[i].substring(0, newline), 1024)
-    var response = parseHttpResponse(segments[i].substring(newline + 1), windowResponseByteLimit)
+    var response = parseHttpResponse(segments[i].substring(newline + 1), windowResponseByteLimit, boundary)
     responses.push({ href: href, status: response.ok ? response.status : 0, body: response.ok ? response.body : "", error: response.ok ? "" : response.error })
   }
   return { ok: true, error: "", code: "", responses: responses }
@@ -810,16 +866,16 @@ function parseWindowResponses(raw) {
 // the calendar collection (RFC 4791 §5.3.2). `If-None-Match: *` makes the
 // server refuse to overwrite anything already there, so a UID collision
 // can never clobber an existing event.
-var caldavPutShell = "url=$1; body=$2; " + caldavCredentialShell
+var caldavPutShell = "url=$1; body=$2; boundary=$3; " + caldavCredentialShell
   + "printf '%s\\n' \"$cfg\" | " + curlBase + " -X PUT -H 'Content-Type: text/calendar; charset=utf-8' -H 'If-None-Match: *' --data-binary \"$body\" \"$url\" || " + networkFailure
 
-function caldavPutCommand(url, body) {
-  return boundedCaptureCommand(["bash", "-c", caldavPutShell, "fmcal-caldav-put", String(url || ""), String(body || "")],
+function caldavPutCommand(url, body, boundary) {
+  return boundedCaptureCommand(["bash", "-c", caldavPutShell, "fmcal-caldav-put", String(url || ""), String(body || ""), validBoundary(boundary)],
     cliResponseByteLimit, cliErrorByteLimit)
 }
 
-function parsePutResponse(raw) {
-  var response = parseHttpResponse(raw)
+function parsePutResponse(raw, boundary) {
+  var response = parseHttpResponse(raw, undefined, boundary)
   if (!response.ok) return { ok: false, error: response.error, code: "" }
   if (response.status === 201 || response.status === 204 || response.status === 200) return { ok: true, error: "", code: "" }
   if (response.status === 401) return { ok: false, error: httpFailure(401).error, code: "auth" }
@@ -994,26 +1050,57 @@ function parseXmlAttributes(source) {
   return attrs
 }
 
+var xmlMaxDepth = 64
+
+// A hand-written scanner rather than one big regex: every step consumes at
+// least one character, an unclosed comment/CDATA/PI/tag swallows the rest
+// of the input in one move, and nesting deeper than xmlMaxDepth is flattened
+// — so a hostile body costs linear time and bounded stack, never a freeze.
 function parseXml(text) {
   var root = { name: "#root", attrs: {}, children: [], text: "" }
   var stack = [root]
   var nodes = 0
-  var pattern = /<!--[\s\S]*?-->|<!\[CDATA\[([\s\S]*?)\]\]>|<\?[\s\S]*?\?>|<!DOCTYPE[^>]*>|<\/([^\s>]+)\s*>|<([^\s\/>]+)((?:\s+[^\s=\/>]+(?:\s*=\s*(?:"[^"]*"|'[^']*'|[^\s"'>]+))?)*)\s*(\/?)>|([^<]+)/g
-  var match
   var source = String(text || "")
-  while ((match = pattern.exec(source)) !== null) {
+  var length = source.length
+  var i = 0
+  var namePattern = /^[^\s\/<>]+/
+  while (i < length) {
     var current = stack[stack.length - 1]
-    if (match[1] !== undefined) {
-      current.text += match[1]
-    } else if (match[2] !== undefined) {
+    var lt = source.indexOf("<", i)
+    if (lt < 0) { current.text += decodeXmlEntities(source.substring(i)); break }
+    if (lt > i) current.text += decodeXmlEntities(source.substring(i, lt))
+    i = lt
+    if (source.startsWith("<!--", i)) {
+      var endComment = source.indexOf("-->", i + 4)
+      i = endComment < 0 ? length : endComment + 3
+    } else if (source.startsWith("<![CDATA[", i)) {
+      var endCdata = source.indexOf("]]>", i + 9)
+      current.text += source.substring(i + 9, endCdata < 0 ? length : endCdata)
+      i = endCdata < 0 ? length : endCdata + 3
+    } else if (source.startsWith("<?", i) || source.startsWith("<!", i)) {
+      var endDecl = source.indexOf(">", i + 2)
+      i = endDecl < 0 ? length : endDecl + 1
+    } else if (source.startsWith("</", i)) {
+      var endClose = source.indexOf(">", i + 2)
       if (stack.length > 1) stack.pop()
-    } else if (match[3] !== undefined) {
+      i = endClose < 0 ? length : endClose + 1
+    } else {
+      var nameMatch = source.substring(i + 1, Math.min(length, i + 1 + 512)).match(namePattern)
+      if (!nameMatch) { current.text += "<"; i += 1; continue }
       if (++nodes > xmlMaxNodes) break
-      var node = { name: xmlLocalName(match[3]), attrs: parseXmlAttributes(match[4]), children: [], text: "" }
+      var endTag = source.indexOf(">", i + 1)
+      if (endTag < 0) {
+        // Unclosed tag: it swallows the rest of the input in one move, with
+        // no attribute scan over that remainder.
+        current.children.push({ name: xmlLocalName(nameMatch[0]), attrs: {}, children: [], text: "" })
+        break
+      }
+      var inner = source.substring(i + 1, endTag)
+      var selfClosing = /\/\s*$/.test(inner)
+      var node = { name: xmlLocalName(nameMatch[0]), attrs: parseXmlAttributes(inner.substring(nameMatch[0].length)), children: [], text: "" }
       current.children.push(node)
-      if (match[5] !== "/") stack.push(node)
-    } else if (match[6] !== undefined) {
-      current.text += decodeXmlEntities(match[6])
+      if (!selfClosing && stack.length < xmlMaxDepth) stack.push(node)
+      i = endTag + 1
     }
   }
   return root
@@ -1240,6 +1327,8 @@ function parseIcsLine(line) {
   return { name: name.toUpperCase(), params: params, value: text.substring(i + 1) }
 }
 
+var icsMaxDepth = 16
+
 function parseIcs(text) {
   var root = { name: "#root", props: [], components: [] }
   var stack = [root]
@@ -1251,7 +1340,7 @@ function parseIcs(text) {
     if (prop.name === "BEGIN") {
       var component = { name: prop.value.trim().toUpperCase(), props: [], components: [] }
       stack[stack.length - 1].components.push(component)
-      stack.push(component)
+      if (stack.length < icsMaxDepth) stack.push(component)
     } else if (prop.name === "END") {
       if (stack.length > 1) stack.pop()
     } else {
@@ -1287,10 +1376,10 @@ function icsComponents(component, name, out) {
 // and failing that the time is read as floating. Windows-style names
 // ("Central Standard Time") fall into that last bucket — the wall clock
 // shown is then the one typed, in the viewer's zone.
-var knownTimeZones = {}
+var knownTimeZones = Object.create(null)
 
 function intlKnowsTimeZone(name) {
-  if (Object.prototype.hasOwnProperty.call(knownTimeZones, name)) return knownTimeZones[name]
+  if (name in knownTimeZones) return knownTimeZones[name]
   var known = false
   try { new Intl.DateTimeFormat("en-US", { timeZone: name }); known = true } catch (error) { known = false }
   knownTimeZones[name] = known
@@ -1429,7 +1518,7 @@ function normalizeIcsEvent(vevent, id, calendarId, instances) {
   var status = String((icsProp(vevent, "STATUS") || { value: "" }).value || "").trim().toUpperCase()
   var rruleProp = icsProp(vevent, "RRULE")
   var rule = rruleProp ? parseRrule(rruleProp.value, start.tz) : null
-  var overrides = {}
+  var overrides = Object.create(null)
 
   var exdates = icsProps(vevent, "EXDATE")
   for (var e = 0; e < exdates.length; e++) {
@@ -1488,7 +1577,7 @@ function parseCalendarObjects(body, calendar, rangeStartMs, rangeEndMs) {
       var data = xmlFind(responses[i].props[p], "calendar-data")
       if (!data) continue
       var vevents = icsComponents(parseIcs(data.text), "VEVENT")
-      var byUid = {}, order = []
+      var byUid = Object.create(null), order = []
       for (var v = 0; v < vevents.length && v < 500; v++) {
         var uid = String((icsProp(vevents[v], "UID") || { value: "" }).value || "").trim() || ("#" + v)
         if (!byUid[uid]) { byUid[uid] = []; order.push(uid) }
@@ -1528,8 +1617,9 @@ function parseCalendarObjects(body, calendar, rangeStartMs, rangeEndMs) {
 // The whole window: every calendar's response, in one pass. A rejected
 // credential anywhere is an auth failure for the window; any other
 // per-calendar failure is reported as a warning while the rest still show.
-function parseCalendarWindow(raw, rangeStartMs, rangeEndMs, calendarsById) {
-  var split = parseWindowResponses(raw)
+function parseCalendarWindow(raw, rangeStartMs, rangeEndMs, calendarsById, boundary) {
+  resetRecurrenceBudget()
+  var split = parseWindowResponses(raw, boundary)
   if (!split.ok) return { ok: false, error: split.error, code: split.code, events: [] }
   var byId = calendarsById && typeof calendarsById === "object" ? calendarsById : {}
   var events = []
@@ -1605,7 +1695,11 @@ var setupCredentialsScript = "set -eu; clear 2>/dev/null || true; "
   + "printf '%s' 'Server URL [" + defaultServerUrl + "]: '; IFS= read -r server; "
   + "server=$(printf '%s' \"$server\" | strip_term | tr -d '[:space:]' | sed 's,/*$,,'); [ -n \"$server\" ] || server=" + defaultServerUrl + "; "
   + "case \"$server\" in https://*) : ;; *) printf '%s\\n' 'The server URL must start with https://'; exit 1;; esac; "
-  + "case \"$server\" in *[\\\"\\'\\\\\\`\\<\\>]*|*[[:cntrl:]]*) printf '%s\\n' 'That server URL has unexpected characters.'; exit 1;; esac; "
+  // Same character class as validServerUrl, so what setup accepts the
+  // service will read back.
+  + "case \"$server\" in *[!A-Za-z0-9._~:/@%+,\\;=!\\&-]*) printf '%s\\n' 'That server URL has unexpected characters.'; exit 1;; esac; "
+  + "shost=$(printf '%s' \"$server\" | sed -E 's,^https://([^/:]+).*,\\1,' | tr 'A-Z' 'a-z'); "
+  + "sbase=$(printf '%s' \"$shost\" | awk -F. 'NF>=2{print $(NF-1)\".\"$NF}'); "
   + "printf '%s' 'Username (usually your email address): '; IFS= read -r username; "
   + "username=$(printf '%s' \"$username\" | strip_term | tr -d '[:space:]'); "
   + "if [ -z \"$username\" ]; then printf '%s\\n' 'No username entered.'; exit 1; fi; "
@@ -1620,11 +1714,19 @@ var setupCredentialsScript = "set -eu; clear 2>/dev/null || true; "
   + "code=$(printf '%s' \"$out\" | cut -d ' ' -f 1); redirect=$(printf '%s' \"$out\" | cut -d ' ' -f 2-); "
   + "case \"$code\" in 301|302|303|307|308) "
   + "case \"$redirect\" in https://*) : ;; *) printf '%s\\n' 'The server redirected somewhere that is not https.'; exit 1;; esac; "
+  // Redirects stay inside the configured server's own domain (the
+  // credentials go along), the same rule the service applies.
+  + "rhost=$(printf '%s' \"$redirect\" | sed -E 's,^https://([^/:]+).*,\\1,' | tr 'A-Z' 'a-z'); "
+  + "if [ \"$rhost\" != \"$shost\" ]; then case \"$rhost\" in *\".$sbase\") : ;; *) printf '%s\\n' \"The server redirected to $rhost, outside its own domain.\"; exit 1;; esac; fi; "
   + "n=$((n + 1)); if [ \"$n\" -gt " + maxDiscoveryRedirects + " ]; then printf '%s\\n' 'Too many redirects.'; exit 1; fi; url=$redirect; continue;; esac; break; done; }; "
   + "printf '%s\\n' 'Checking the server…'; "
   + "case \"$server\" in https://*/*) probe \"$server\";; *) probe \"$server/.well-known/caldav\"; case \"$code\" in 404|405) probe \"$server/\";; esac;; esac; "
   + "case \"$code\" in 2??) : ;; 401|403) printf '%s\\n' 'The server rejected that username and password.'; exit 1;; "
   + "*) printf '%s\\n' \"The server answered HTTP $code — check the server URL.\"; exit 1;; esac; "
+  // A server that answers that address without a login could not have
+  // checked the password; say so rather than pretend it did.
+  + "anon=$(curl -sS --max-time 20 --proto =https --max-redirs 0 -o /dev/null -w '%{http_code}' -X PROPFIND -H 'Depth: 0' \"$url\" 2>/dev/null || printf '000'); "
+  + "case \"$anon\" in 2??) printf '%s\\n' 'Note: the server did not ask for a password there, so these credentials could not be checked. Saving anyway.';; esac; "
   + "secret-tool clear service " + shellQuote(secretService) + " account " + shellQuote(secretAccount) + " 2>/dev/null || true; "
   + "printf '%s' \"$password\" | secret-tool store --label='Fastmail Calendar (CalDAV) app password' service " + shellQuote(secretService) + " account " + shellQuote(secretAccount) + " server \"$server\" username \"$username\"; "
   + "unset password cfg; "
@@ -1729,7 +1831,8 @@ function nextEventLabel(events, nowMs) {
 // ---------------------------------------------------------------------------
 
 var maximumCalendarPrefEntries = 128
-var calendarPrefsCharacterLimit = 32768
+var calendarPrefsCharacterLimit = 131072
+var calendarPrefIdCharacterLimit = 1024
 
 // Chromatic palette only — no black/white/grey, which make unreadable dots
 // on a themed background. Reused verbatim from omarchy-fastmail's avatar
@@ -1764,18 +1867,27 @@ function parseCalendarPrefs(raw) {
   }
 }
 
+// Writes never exceed what parseCalendarPrefs will read back: entries are
+// added in order until the serialized text would pass the character limit.
 function serializeCalendarPrefs(prefs) {
   var out = {}
   var keys = Object.keys(prefs || {}).slice(0, maximumCalendarPrefEntries)
+  var text = "{}"
   for (var i = 0; i < keys.length; i++) {
-    var entry = prefs[keys[i]] || {}
-    out[boundedString(keys[i], remoteIdCharacterLimit)] = {
+    var entry = prefs[keys[i]] && typeof prefs[keys[i]] === "object" ? prefs[keys[i]] : {}
+    var color = typeof entry.color === "string" ? normalizeCalendarColor(entry.color) : ""
+    var name = typeof entry.name === "string" ? cleanText(entry.name, remoteNameCharacterLimit) : ""
+    var candidate = {
       visible: entry.visible !== false,
-      color: entry.color !== undefined && entry.color !== "" ? cleanText(entry.color, 32) : undefined,
-      name: entry.name !== undefined && entry.name !== "" ? cleanText(entry.name, remoteNameCharacterLimit) : undefined
+      color: color !== "" ? color : undefined,
+      name: name !== "" ? name : undefined
     }
+    out[boundedString(keys[i], calendarPrefIdCharacterLimit)] = candidate
+    var next = JSON.stringify(out)
+    if (next.length > calendarPrefsCharacterLimit) { delete out[boundedString(keys[i], calendarPrefIdCharacterLimit)]; break }
+    text = next
   }
-  return JSON.stringify(out)
+  return text
 }
 
 // Merges the live calendar list with stored prefs: a calendar not yet seen
@@ -1789,12 +1901,14 @@ function mergeCalendarPrefs(calendars, storedPrefsRaw) {
   var out = []
   for (var i = 0; i < source.length; i++) {
     var cal = source[i]
-    var pref = prefs[cal.id] || {}
+    var pref = Object.prototype.hasOwnProperty.call(prefs, cal.id) && prefs[cal.id] && typeof prefs[cal.id] === "object" ? prefs[cal.id] : {}
+    var prefName = typeof pref.name === "string" ? cleanText(pref.name, remoteNameCharacterLimit) : ""
+    var prefColor = typeof pref.color === "string" ? normalizeCalendarColor(pref.color) : ""
     out.push({
       id: cal.id,
-      name: pref.name !== undefined && pref.name !== "" ? pref.name : cal.name,
+      name: prefName !== "" ? prefName : cal.name,
       serverName: cal.name,
-      color: pref.color !== undefined && pref.color !== "" ? pref.color : (cal.color || fallbackCalendarColor(cal.id)),
+      color: prefColor !== "" ? prefColor : (cal.color || fallbackCalendarColor(cal.id)),
       visible: pref.visible !== false
     })
   }
@@ -1827,7 +1941,9 @@ if (typeof module !== "undefined") {
     isNoCredentialsError: isNoCredentialsError, isMissingToolError: isMissingToolError,
     secretService: secretService, secretAccount: secretAccount, defaultServerUrl: defaultServerUrl,
     fastmailAppPasswordHelpUrl: fastmailAppPasswordHelpUrl, maxDiscoveryRedirects: maxDiscoveryRedirects,
-    validServerUrl: validServerUrl, serverOrigin: serverOrigin, serverPath: serverPath,
+    validServerUrl: validServerUrl, serverOrigin: serverOrigin, serverPath: serverPath, serverHost: serverHost, redirectAllowed: redirectAllowed,
+    newBoundary: newBoundary, validBoundary: validBoundary, resetRecurrenceBudget: resetRecurrenceBudget, recurrenceBudget: recurrenceBudget,
+    xmlMaxDepth: xmlMaxDepth, icsMaxDepth: icsMaxDepth,
     discoveryStartUrl: discoveryStartUrl, resolveHref: resolveHref,
     secretLookupCommand: secretLookupCommand, secretClearCommand: secretClearCommand,
     accountInfoShell: accountInfoShell, accountInfoCommand: accountInfoCommand, parseAccountInfo: parseAccountInfo,
