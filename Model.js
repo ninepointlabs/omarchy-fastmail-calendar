@@ -1560,7 +1560,7 @@ function parseCalendarWindow(raw, rangeStartMs, rangeEndMs, calendarsById) {
 
 var setupLockDirectoryName = "setup-lock"
 // No ${...} anywhere in a script that reaches a floating terminal: the
-// launcher goes through uwsm-app -> systemd-run, which expands ${NAME} forms
+// launcher runs the command through a transient unit runner that expands ${NAME}
 // as environment variables (systemd >= 254, --expand-environment=yes by
 // default) before bash ever sees the text — ${server:-x} became "".
 var setupLockShell = "uid=$(id -u) || exit 76; "
