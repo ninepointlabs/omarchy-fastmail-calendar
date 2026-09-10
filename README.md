@@ -7,6 +7,8 @@ Baïkal, iCloud, Google (via its CalDAV endpoint), a self-hosted DAViCal —
 anything that speaks RFC 4791. No external CLI, no mail, no journal: this
 plugin reads your calendars, shows them, and can add an event.
 
+<img src="preview.png" width="600" alt="Month view: the grid with activity dots, opened from the bar chip">
+
 ## Why CalDAV and not Fastmail's API
 
 Fastmail exposes mail, contacts and masked email over JMAP, to API tokens
