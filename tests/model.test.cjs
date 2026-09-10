@@ -303,6 +303,12 @@ test("the CalDAV request scripts take the password from the keyring, never from 
 test("the setup script hides the password, checks the server first, and stores via stdin", () => {
   const script = Model.setupCredentialsScript
   assert.match(script, /stty -echo/)
+  // Queued terminal query replies must be drained before the first read and
+  // any escape residue stripped, or they answer the server prompt.
+  assert.ok(script.indexOf("read -rsn 1 -t 0.2 _") < script.indexOf("read -r server"))
+  assert.match(script, /strip_term\(\) \{ sed -E/)
+  assert.match(script, /"\$server" \| strip_term/)
+  assert.match(script, /"\$username" \| strip_term/)
   assert.match(script, /curl -sS --max-time 20 --proto =https --max-redirs 0 -K -/)
   assert.match(script, /secret-tool clear service/)
   assert.match(script, /printf '%s' "\$password" \| secret-tool store/)
