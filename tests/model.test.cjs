@@ -1,7 +1,8 @@
 // Node test runner (`node --test tests/model.test.cjs`) covering: calendar
 // grid/date math, timezone-safe recurrence expansion (including a real
-// America/Chicago DST transition), JMAP request/response handling, the
-// credential/setup scripts' shape, and calendar preference persistence.
+// America/Chicago DST transition), CalDAV discovery/request framing, WebDAV
+// and iCalendar parsing, the credential/setup scripts' shape, and calendar
+// preference persistence.
 //
 // Dates are read in the host's own zone wherever that matters (eventStartKey
 // for timed events, mirroring what a viewer actually sees), so TZ is pinned
@@ -237,135 +238,281 @@ test("boundedString truncates without splitting a surrogate pair", () => {
 
 // ----------------------------------------------------------------- Credentials --
 
-test("validToken accepts the expected character class and rejects the rest", () => {
-  assert.equal(Model.validToken("fmu1-abc123.def_ghi-0"), "fmu1-abc123.def_ghi-0")
-  assert.equal(Model.validToken(""), "")
-  assert.equal(Model.validToken("has a space"), "")
-  assert.equal(Model.validToken('quote"here'), "")
-  assert.equal(Model.validToken("a".repeat(600)), "")
+test("validServerUrl accepts https origins and paths, rejects everything else", () => {
+  assert.equal(Model.validServerUrl("https://caldav.fastmail.com/"), "https://caldav.fastmail.com")
+  assert.equal(Model.validServerUrl("https://nc.example.org:8443/remote.php/dav/"), "https://nc.example.org:8443/remote.php/dav")
+  assert.equal(Model.validServerUrl("http://caldav.fastmail.com"), "")
+  assert.equal(Model.validServerUrl("https://host/path with space"), "")
+  assert.equal(Model.validServerUrl("https://host/'; rm -rf"), "")
+  assert.equal(Model.validServerUrl(""), "")
 })
 
-test("the JMAP request script never accepts a token as an argument", () => {
-  // The token only ever enters through `secret-tool lookup` inside the
-  // script; the wrapping command's own trailing argv is method/url/body only.
-  const command = Model.jmapRequestCommand("GET", "https://api.fastmail.com/jmap/session", "")
-  assert.deepEqual(command.slice(-3), ["GET", "https://api.fastmail.com/jmap/session", ""])
-  assert.match(Model.jmapRequestShell, /secret-tool lookup/)
-  assert.match(Model.jmapRequestShell, /curl -sS --max-time 20 -K -/)
-  assert.doesNotMatch(Model.jmapRequestShell, /-H ['"]Authorization/)
+test("discoveryStartUrl bootstraps from /.well-known/caldav only for a bare origin", () => {
+  assert.equal(Model.discoveryStartUrl("https://caldav.fastmail.com"), "https://caldav.fastmail.com/.well-known/caldav")
+  assert.equal(Model.discoveryStartUrl("https://caldav.fastmail.com/"), "https://caldav.fastmail.com/.well-known/caldav")
+  assert.equal(Model.discoveryStartUrl("https://nc.example.org/remote.php/dav"), "https://nc.example.org/remote.php/dav")
 })
 
-test("secretLookupCommand and secretClearCommand are fixed argv with no token value", () => {
-  // The keyring entry is addressed by service/account only; the token value
-  // itself never appears in argv, nor does any shell placeholder for it.
-  const expected = {
-    lookup: Model.secretLookupCommand(),
-    clear: Model.secretClearCommand(),
-  }
+test("resolveHref keeps same-origin paths and refuses anything else", () => {
+  const origin = "https://caldav.fastmail.com"
+  assert.equal(Model.resolveHref("/dav/calendars/user/a%40b.c/", origin), "/dav/calendars/user/a%40b.c/")
+  assert.equal(Model.resolveHref("https://caldav.fastmail.com/dav/x/", origin), "/dav/x/")
+  assert.equal(Model.resolveHref("https://evil.example/dav/x/", origin), "")
+  assert.equal(Model.resolveHref("dav/relative", origin), "")
+  assert.equal(Model.resolveHref("/dav/with space", origin), "")
+  assert.equal(Model.resolveHref("/dav/$(id)", origin), "/dav/$(id)") // argv, never a shell string — harmless
+})
+
+test("parseAccountInfo reads only the server and username attributes", () => {
+  const info = Model.parseAccountInfo("attribute.account = caldav\nattribute.service = x\nattribute.server = https://caldav.fastmail.com\nattribute.username = tim@example.com\n")
+  assert.deepEqual(info, { server: "https://caldav.fastmail.com", username: "tim@example.com" })
+  assert.deepEqual(Model.parseAccountInfo(""), { server: "", username: "" })
+  assert.deepEqual(Model.parseAccountInfo("attribute.server = http://plain\n"), { server: "", username: "" })
+})
+
+test("secretLookupCommand and secretClearCommand are fixed argv with no secret value", () => {
+  const expected = { lookup: Model.secretLookupCommand(), clear: Model.secretClearCommand() }
   for (const [verb, command] of Object.entries(expected)) {
     assert.deepEqual(command.slice(-6),
       ["secret-tool", verb, "service", Model.secretService, "account", Model.secretAccount])
     const tail = command.slice(command.indexOf("secret-tool"))
     assert.ok(tail.every(part => !/[$<>{}]/.test(part)), "no placeholder or interpolation in " + verb)
-    assert.ok(tail.every(part => !/^fmu1-/.test(part)), "no Fastmail token value in " + verb)
   }
 })
 
-test("the setup token script hides input and never echoes the token", () => {
-  assert.match(Model.setupTokenScript, /stty -echo/)
-  assert.match(Model.setupTokenScript, /secret-tool store/)
-  assert.doesNotMatch(Model.setupTokenScript, /echo\s+"?\$token/)
-  assert.doesNotMatch(Model.setupTokenScript, /printf[^\n]*\$token[^\n]*\n.*echo/)
+test("the account-info command only lets attribute lines through", () => {
+  assert.match(Model.accountInfoShell, /secret-tool search/)
+  assert.match(Model.accountInfoShell, /grep '\^attribute\\\.'/)
 })
 
-test("setupLaunchCommand wraps the token script in the lock/trap/completion structure", () => {
+test("the CalDAV request scripts take the password from the keyring, never from argv", () => {
+  const command = Model.caldavRequestCommand("PROPFIND", "0", "https://caldav.fastmail.com/.well-known/caldav", "<x/>")
+  assert.deepEqual(command.slice(-4), ["PROPFIND", "0", "https://caldav.fastmail.com/.well-known/caldav", "<x/>"])
+  for (const script of [Model.caldavRequestShell, Model.caldavWindowShell]) {
+    assert.match(script, /secret-tool lookup/)
+    assert.match(script, /curl -sS --max-time 25 --proto =https --max-redirs 0 -K -/)
+    assert.doesNotMatch(script, /-u\s/)
+    assert.doesNotMatch(script, /--user\s/)
+    assert.match(script, /unset password/)
+  }
+  const window = Model.caldavWindowCommand("https://caldav.fastmail.com", ["/dav/a/", "/dav/b/"], Date.UTC(2026, 2, 1), Date.UTC(2026, 3, 1))
+  assert.deepEqual(window.slice(-2), ["/dav/a/", "/dav/b/"])
+  assert.match(window[window.length - 3], /<C:time-range start="20260301T000000Z" end="20260401T000000Z"\/>/)
+})
+
+test("the setup script hides the password, checks the server first, and stores via stdin", () => {
+  const script = Model.setupCredentialsScript
+  assert.match(script, /stty -echo/)
+  assert.match(script, /curl -sS --max-time 20 --proto =https --max-redirs 0 -K -/)
+  assert.match(script, /secret-tool clear service/)
+  assert.match(script, /printf '%s' "\$password" \| secret-tool store/)
+  assert.match(script, /server "\$server" username "\$username"/)
+  assert.doesNotMatch(script, /echo\s+"?\$password/)
+  assert.ok(script.indexOf("Checking the server") < script.indexOf("secret-tool store"))
+  assert.match(script, new RegExp("\\[" + Model.defaultServerUrl.replace(/[.\/]/g, "\\$&") + "\\]"))
+})
+
+test("setupLaunchCommand wraps the credentials script in the lock/trap/completion structure", () => {
   const command = Model.setupLaunchCommand("ninepointlabs.fastmail-calendar")
   assert.match(command, /flock -n 9/)
-  assert.match(command, /trap 'rc=\$\?/)
-  assert.match(command, /setupFinished/)
-  assert.match(command, new RegExp(Model.setupTokenScript.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")))
+  assert.match(command, /omarchy-shell -q "\$target" setupFinished/)
+  assert.match(command, /trap 'rc=\$\?; trap - EXIT; flock -u 9;/)
+  assert.ok(command.indexOf(Model.setupCredentialsScript) > 0)
 })
 
-test("isAuthError/isNoTokenError/isMissingToolError classify the script's own error envelopes", () => {
-  const noToken = Model.parseFailure("", '{"ok":false,"error":"No Fastmail API token stored","code":"no_token"}')
-  assert.equal(Model.isAuthError(noToken.code), true)
-  assert.equal(Model.isNoTokenError(noToken.code), true)
-
-  const badScope = Model.parseFailure('{"apiUrl":"x"}', "")
-  const session = Model.parseSession('{"apiUrl":"x"}')
-  assert.equal(session.ok, false)
-  assert.equal(Model.isAuthError(session.code), true)
-  assert.equal(Model.isNoTokenError(session.code), false)
-
-  const missing = Model.parseFailure("", '{"ok":false,"error":"curl is required","code":"missing_tool"}')
-  assert.equal(Model.isMissingToolError(missing.code), true)
-  assert.equal(Model.isAuthError(missing.code), false)
+test("setupPlan distinguishes never-connected from rejected credentials", () => {
+  assert.equal(Model.setupPlan(false, false).needed, true)
+  assert.match(Model.setupPlan(false, false).buttonLabel, /^Connect/)
+  assert.match(Model.setupPlan(true, false).buttonLabel, /^Reconnect/)
+  assert.equal(Model.setupPlan(true, true).needed, false)
 })
 
-// ------------------------------------------------------------------- Session --
-
-test("parseSession reads the calendars account and api url", () => {
-  const raw = JSON.stringify({
-    apiUrl: "https://jmap.fastmail.com/api/",
-    primaryAccounts: { "urn:ietf:params:jmap:calendars": "u1234" }
-  })
-  const session = Model.parseSession(raw)
-  assert.equal(session.ok, true)
-  assert.equal(session.apiUrl, "https://jmap.fastmail.com/api/")
-  assert.equal(session.accountId, "u1234")
+test("isAuthError/isNoCredentialsError/isMissingToolError classify the script's own error envelopes", () => {
+  assert.equal(Model.isAuthError("auth"), true)
+  assert.equal(Model.isAuthError("no_credentials"), true)
+  assert.equal(Model.isAuthError("network"), false)
+  assert.equal(Model.isNoCredentialsError("no_credentials"), true)
+  assert.equal(Model.isNoCredentialsError("auth"), false)
+  assert.equal(Model.isMissingToolError("missing_tool"), true)
+  const failure = Model.parseFailure("", '{"ok":false,"error":"No calendar credentials stored","code":"no_credentials"}')
+  assert.equal(failure.ok, false)
+  assert.equal(failure.code, "no_credentials")
 })
 
-test("parseSession fails cleanly when the token lacks calendar access", () => {
-  const session = Model.parseSession(JSON.stringify({ apiUrl: "x", primaryAccounts: {} }))
-  assert.equal(session.ok, false)
-  assert.equal(session.code, "auth")
+// ------------------------------------------------------------ HTTP framing --
+
+test("parseHttpResponse splits curl's body from its status trailer", () => {
+  const response = Model.parseHttpResponse("<x/>\n--fmcal-http-- 301 https://caldav.fastmail.com/dav/calendars\n")
+  assert.deepEqual([response.ok, response.status, response.redirect, response.body], [true, 301, "https://caldav.fastmail.com/dav/calendars", "<x/>"])
+  assert.equal(Model.parseHttpResponse("no trailer at all").ok, false)
+  assert.equal(Model.isRedirectStatus(302), true)
+  assert.equal(Model.isRedirectStatus(207), false)
+  assert.equal(Model.httpFailure(401).code, "auth")
+  assert.equal(Model.httpFailure(404).code, "not_found")
 })
 
-// ------------------------------------------------------------------ Calendars --
-
-test("parseCalendarGet normalizes and sorts by sortOrder then name", () => {
-  const raw = JSON.stringify({
-    methodResponses: [["Calendar/get", { list: [
-      { id: "c2", name: "Personal", sortOrder: 2, color: "#ff0000" },
-      { id: "c1", name: "Work", sortOrder: 1 },
-      { id: "", name: "Skipped (no id)" }
-    ] }, "c0"]]
-  })
-  const result = Model.parseCalendarGet(raw)
-  assert.equal(result.ok, true)
-  assert.deepEqual(result.calendars.map(c => c.id), ["c1", "c2"])
+test("parseWindowResponses frames one response per calendar href", () => {
+  const raw = "\n--fmcal-begin-- /dav/a/\n<a/>\n--fmcal-http-- 207 \n\n--fmcal-begin-- /dav/b/\n<b/>\n--fmcal-http-- 404 \n"
+  const split = Model.parseWindowResponses(raw)
+  assert.equal(split.ok, true)
+  assert.deepEqual(split.responses.map(r => [r.href, r.status, r.body]), [["/dav/a/", 207, "<a/>"], ["/dav/b/", 404, "<b/>"]])
 })
 
-test("parseCalendarEventWindow expands recurring events, attaches calendar info, and drops cancelled ones", () => {
-  const raw = JSON.stringify({
-    methodResponses: [
-      ["CalendarEvent/query", { ids: ["e1", "e2"] }, "q0"],
-      ["CalendarEvent/get", { list: [
-        {
-          id: "e1", uid: "e1", title: "Standup", start: "2026-01-05T09:00:00", timeZone: "",
-          duration: "PT30M", calendarIds: { cal1: true }, status: "confirmed"
-        },
-        {
-          id: "e2", title: "Cancelled thing", start: "2026-01-06T09:00:00",
-          duration: "PT30M", calendarIds: { cal1: true }, status: "cancelled"
-        }
-      ], notFound: [] }, "e0"]
-    ]
-  })
-  const byId = { cal1: { id: "cal1", name: "Work", color: "#61afef" } }
-  const result = Model.parseCalendarEventWindow(raw, Date.UTC(2026, 0, 1), Date.UTC(2026, 1, 1), byId)
-  assert.equal(result.ok, true)
-  assert.equal(result.events.length, 1)
-  assert.equal(result.events[0].title, "Standup")
-  assert.equal(result.events[0].calendarName, "Work")
-  assert.equal(result.events[0].calendarColor, "#61afef")
+// ---------------------------------------------------------------- XML/DAV --
+
+test("parseXml strips prefixes, decodes entities, keeps attributes and CDATA, ignores comments", () => {
+  const doc = Model.parseXml('<?xml version="1.0"?><!-- c --><d:a xmlns:d="DAV:"><d:b n="x&amp;y">1 &lt; 2</d:b><c><![CDATA[<raw>]]></c><e/></d:a>')
+  const a = Model.xmlFind(doc, "a")
+  assert.equal(Model.xmlText(Model.xmlFind(a, "b")), "1 < 2")
+  assert.equal(Model.xmlFind(a, "b").attrs.n, "x&y")
+  assert.equal(Model.xmlText(Model.xmlFind(a, "c")), "<raw>")
+  assert.equal(Model.xmlChildren(a, "e").length, 1)
+  assert.equal(Model.parseXml("<broken").children.length, 0)
 })
 
-test("calendarEventWindowRequestBody uses a JMAP back-reference rather than a second round trip", () => {
-  const body = JSON.parse(Model.calendarEventWindowRequestBody("u1", ["c1"], "2026-01-01T00:00:00Z", "2026-02-01T00:00:00Z"))
-  assert.equal(body.methodCalls[0][0], "CalendarEvent/query")
-  assert.equal(body.methodCalls[1][0], "CalendarEvent/get")
-  assert.deepEqual(body.methodCalls[1][1]["#ids"], { resultOf: "q0", name: "CalendarEvent/query", path: "/ids" })
+test("parseDiscovery reads the principal and the calendar home as same-origin paths", () => {
+  const origin = "https://caldav.fastmail.com"
+  const viaPrincipal = '<d:multistatus xmlns:d="DAV:"><d:response><d:href>/dav/calendars</d:href><d:propstat><d:prop><d:current-user-principal><d:href>/dav/principals/user/tim%40example.com/</d:href></d:current-user-principal></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response></d:multistatus>'
+  assert.deepEqual(Model.parseDiscovery(viaPrincipal, origin), { ok: true, error: "", homeHref: "", principalHref: "/dav/principals/user/tim%40example.com/" })
+  const viaHome = '<D:multistatus xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav"><D:response><D:href>/p/</D:href><D:propstat><D:prop><C:calendar-home-set><D:href>https://caldav.fastmail.com/dav/calendars/user/tim%40example.com/</D:href></C:calendar-home-set></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response></D:multistatus>'
+  assert.equal(Model.parseDiscovery(viaHome, origin).homeHref, "/dav/calendars/user/tim%40example.com/")
+  const foreign = viaHome.replace("https://caldav.fastmail.com/dav", "https://evil.example/dav")
+  assert.equal(Model.parseDiscovery(foreign, origin).homeHref, "")
+  assert.equal(Model.parseDiscovery("<html>login</html>", origin).ok, false)
+})
+
+test("parseCalendarList keeps event calendars, skips the home, task lists, schedule boxes and other origins", () => {
+  const list = '<D:multistatus xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav" xmlns:A="http://apple.com/ns/ical/">'
+    + '<D:response><D:href>/dav/calendars/user/tim%40example.com/</D:href><D:propstat><D:prop><D:resourcetype><D:collection/></D:resourcetype></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>'
+    + '<D:response><D:href>/dav/calendars/user/tim%40example.com/work/</D:href><D:propstat><D:prop><D:displayname>Work &amp; Life</D:displayname><D:resourcetype><D:collection/><C:calendar/></D:resourcetype><A:calendar-color>#FF5733FF</A:calendar-color><A:calendar-order>2</A:calendar-order><C:supported-calendar-component-set><C:comp name="VEVENT"/></C:supported-calendar-component-set></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>'
+    + '<D:response><D:href>/dav/calendars/user/tim%40example.com/family/</D:href><D:propstat><D:prop><D:resourcetype><D:collection/><C:calendar/></D:resourcetype><A:calendar-order>1</A:calendar-order></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat><D:propstat><D:prop><D:displayname/></D:prop><D:status>HTTP/1.1 404 Not Found</D:status></D:propstat></D:response>'
+    + '<D:response><D:href>/dav/calendars/user/tim%40example.com/tasks/</D:href><D:propstat><D:prop><D:displayname>Tasks</D:displayname><D:resourcetype><D:collection/><C:calendar/></D:resourcetype><C:supported-calendar-component-set><C:comp name="VTODO"/></C:supported-calendar-component-set></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>'
+    + '<D:response><D:href>/dav/calendars/user/tim%40example.com/inbox/</D:href><D:propstat><D:prop><D:resourcetype><D:collection/><C:schedule-inbox/></D:resourcetype></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>'
+    + '<D:response><D:href>https://evil.example/x/</D:href><D:propstat><D:prop><D:resourcetype><D:collection/><C:calendar/></D:resourcetype></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>'
+    + '</D:multistatus>'
+  const parsed = Model.parseCalendarList(list, "https://caldav.fastmail.com")
+  assert.equal(parsed.ok, true)
+  assert.deepEqual(parsed.calendars.map(c => [c.id, c.name, c.color, c.sortOrder]), [
+    ["/dav/calendars/user/tim%40example.com/family/", "family", "", 1],
+    ["/dav/calendars/user/tim%40example.com/work/", "Work & Life", "#FF5733", 2]
+  ])
+})
+
+// ------------------------------------------------------------- iCalendar --
+
+test("parseIcsLine handles parameters, quoted parameter values and escapes", () => {
+  const line = Model.parseIcsLine('DTSTART;TZID="America/Chicago";VALUE=DATE-TIME:20260302T090000')
+  assert.deepEqual([line.name, line.params.TZID, line.params.VALUE, line.value], ["DTSTART", ["America/Chicago"], ["DATE-TIME"], "20260302T090000"])
+  assert.equal(Model.parseIcsLine("BROKEN LINE"), null)
+  assert.equal(Model.icsUnescape("a\\, b\\; c\\nd\\\\e"), "a, b; c\nd\\e")
+  assert.equal(Model.unfoldIcs("SUMMARY:long\r\n  line\r\nX:1"), "SUMMARY:long line\nX:1")
+})
+
+test("icsDateValue reads DATE, floating, TZID and UTC forms", () => {
+  assert.deepEqual(Model.icsDateValue({ value: "20260310", params: { VALUE: ["DATE"] } }, ""), { allDay: true, local: "2026-03-10T00:00:00", tz: "" })
+  assert.deepEqual(Model.icsDateValue({ value: "20260310T090000", params: {} }, ""), { allDay: false, local: "2026-03-10T09:00:00", tz: "" })
+  assert.deepEqual(Model.icsDateValue({ value: "20260310T090000", params: { TZID: ["America/Chicago"] } }, ""), { allDay: false, local: "2026-03-10T09:00:00", tz: "America/Chicago" })
+  assert.deepEqual(Model.icsDateValue({ value: "20260310T140000Z", params: {} }, ""), { allDay: false, local: "2026-03-10T14:00:00", tz: "UTC" })
+  assert.equal(Model.icsDateValue({ value: "garbage", params: {} }, ""), null)
+})
+
+test("normalizeTzid trusts Intl, unwraps namespaced ids, and floats the rest", () => {
+  assert.equal(Model.normalizeTzid("America/Chicago"), "America/Chicago")
+  assert.equal(Model.normalizeTzid("/freeassociation.sourceforge.net/Tzfile/America/Chicago"), "America/Chicago")
+  assert.equal(Model.normalizeTzid("Z"), "UTC")
+  assert.equal(Model.normalizeTzid("Central Standard Time"), "")
+})
+
+test("parseRrule maps RRULE onto the recurrence engine's rule shape, with UNTIL in the event's zone", () => {
+  const rule = Model.parseRrule("FREQ=MONTHLY;INTERVAL=2;BYDAY=2TU,-1FR;UNTIL=20261231T235959Z;WKST=MO", "America/Chicago")
+  assert.deepEqual(rule, { frequency: "monthly", interval: 2, byDay: [{ day: "tu", nthOfPeriod: 2 }, { day: "fr", nthOfPeriod: -1 }], until: "2026-12-31T17:59:59" })
+  assert.deepEqual(Model.parseRrule("FREQ=YEARLY;BYMONTH=7;BYMONTHDAY=4;COUNT=3", ""), { frequency: "yearly", byMonth: [7], byMonthDay: [4], count: 3 })
+  assert.deepEqual(Model.parseRrule("FREQ=DAILY;UNTIL=20260320", ""), { frequency: "daily", until: "2026-03-20T23:59:59" })
+  assert.equal(Model.parseRrule("INTERVAL=2", ""), null)
+})
+
+const sampleIcs = [
+  "BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//Fastmail//",
+  "BEGIN:VTIMEZONE", "TZID:America/Chicago", "END:VTIMEZONE",
+  "BEGIN:VEVENT", "UID:abc-123",
+  "DTSTART;TZID=America/Chicago:20260302T090000", "DTEND;TZID=America/Chicago:20260302T093000",
+  "RRULE:FREQ=WEEKLY;COUNT=4", "EXDATE;TZID=America/Chicago:20260316T090000",
+  "SUMMARY:Standup\\, weekly", "DESCRIPTION:Line one\\nLine two", "LOCATION:Room A", "END:VEVENT",
+  "BEGIN:VEVENT", "UID:abc-123", "RECURRENCE-ID;TZID=America/Chicago:20260309T090000",
+  "DTSTART;TZID=America/Chicago:20260309T100000", "DTEND;TZID=America/Chicago:20260309T110000",
+  "SUMMARY:Standup (moved)", "END:VEVENT",
+  "END:VCALENDAR"
+].join("\r\n")
+
+test("normalizeIcsObject folds EXDATE and RECURRENCE-ID instances into recurrenceOverrides", () => {
+  const vevents = Model.icsComponents(Model.parseIcs(sampleIcs), "VEVENT")
+  assert.equal(vevents.length, 2)
+  const [event] = Model.normalizeIcsObject(vevents, "/dav/work/1.ics", "/dav/work/")
+  assert.equal(event.title, "Standup, weekly")
+  assert.equal(event.description, "Line one Line two") // cleanText collapses whitespace, newlines included
+  assert.equal(event.timeZone, "America/Chicago")
+  assert.equal(event.durationMs, 30 * 60 * 1000)
+  assert.deepEqual(event.recurrenceRules, [{ frequency: "weekly", count: 4 }])
+  assert.deepEqual(event.recurrenceOverrides["2026-03-16T09:00:00"], { excluded: true })
+  const moved = event.recurrenceOverrides["2026-03-09T09:00:00"]
+  assert.equal(moved.start, "2026-03-09T10:00:00")
+  assert.equal(moved.title, "Standup (moved)")
+  assert.equal(moved.durationMs, 60 * 60 * 1000)
+})
+
+test("an object holding only detached instances yields each as a standalone event", () => {
+  const ics = "BEGIN:VCALENDAR\nBEGIN:VEVENT\nUID:solo\nRECURRENCE-ID:20260305T100000Z\nDTSTART:20260305T100000Z\nDTEND:20260305T103000Z\nSUMMARY:One instance\nEND:VEVENT\nEND:VCALENDAR"
+  const events = Model.normalizeIcsObject(Model.icsComponents(Model.parseIcs(ics), "VEVENT"), "/dav/x/1.ics", "/dav/x/")
+  assert.equal(events.length, 1)
+  assert.equal(events[0].startLocal, "2026-03-05T10:00:00")
+  assert.equal(events[0].timeZone, "UTC")
+  assert.equal(events[0].recurrenceRules, null)
+})
+
+test("parseCalendarWindow expands recurring events across DST, honors overrides, attaches calendar info, and skips cancelled ones", () => {
+  const escape = t => t.replace(/&/g, "&amp;").replace(/</g, "&lt;")
+  const allDay = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:day1\r\nDTSTART;VALUE=DATE:20260310\r\nDTEND;VALUE=DATE:20260312\r\nSUMMARY:Trip\r\nEND:VEVENT\r\nEND:VCALENDAR"
+  const cancelled = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:gone\r\nDTSTART:20260311T100000Z\r\nSTATUS:CANCELLED\r\nSUMMARY:Nope\r\nEND:VEVENT\r\nEND:VCALENDAR"
+  const body = '<D:multistatus xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">'
+    + '<D:response><D:href>/dav/work/1.ics</D:href><D:propstat><D:prop><C:calendar-data>' + escape(sampleIcs) + '</C:calendar-data></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>'
+    + '<D:response><D:href>/dav/work/2.ics</D:href><D:propstat><D:prop><C:calendar-data><![CDATA[' + allDay + ']]></C:calendar-data></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>'
+    + '<D:response><D:href>/dav/work/3.ics</D:href><D:propstat><D:prop><C:calendar-data>' + escape(cancelled) + '</C:calendar-data></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>'
+    + '</D:multistatus>'
+  const raw = "\n--fmcal-begin-- /dav/work/\n" + body + "\n--fmcal-http-- 207 \n\n--fmcal-begin-- /dav/missing/\n<html/>\n--fmcal-http-- 404 \n"
+  const calendars = { "/dav/work/": { id: "/dav/work/", name: "Work", color: "#112233" } }
+  const parsed = Model.parseCalendarWindow(raw, Date.UTC(2026, 2, 1), Date.UTC(2026, 3, 1), calendars)
+  assert.equal(parsed.ok, true)
+  assert.match(parsed.error, /missing: HTTP 404/)
+  assert.deepEqual(parsed.events.map(e => [e.startMs, (e.endMs - e.startMs) / 60000, e.title, e.allDay, e.moved, e.calendarName, e.calendarColor]), [
+    [Date.UTC(2026, 2, 2, 15), 30, "Standup, weekly", false, false, "Work", "#112233"],
+    [Date.UTC(2026, 2, 9, 15), 60, "Standup (moved)", false, true, "Work", "#112233"],
+    [Date.UTC(2026, 2, 10), 2880, "Trip", true, false, "Work", "#112233"],
+    [Date.UTC(2026, 2, 23, 14), 30, "Standup, weekly", false, false, "Work", "#112233"]
+  ])
+})
+
+test("a rejected credential on any calendar fails the whole window as an auth error", () => {
+  const raw = "\n--fmcal-begin-- /dav/a/\n<x/>\n--fmcal-http-- 207 \n\n--fmcal-begin-- /dav/b/\n\n--fmcal-http-- 401 \n"
+  const parsed = Model.parseCalendarWindow(raw, 0, 1, {})
+  assert.equal(parsed.ok, false)
+  assert.equal(parsed.code, "auth")
+})
+
+test("an RRULE the engine cannot expand still shows the event's own start", () => {
+  const event = {
+    startLocal: "2026-03-05T10:00:00", timeZone: "", durationMs: 3600000, allDay: false,
+    recurrenceRules: [{ frequency: "hourly", count: 5 }], recurrenceOverrides: {}, title: "Hourly", description: "", location: ""
+  }
+  const occurrences = Model.expandOccurrences(event, Date.UTC(2026, 2, 1), Date.UTC(2026, 3, 1))
+  assert.equal(occurrences.length, 1)
+})
+
+test("request bodies are well-formed and ask for exactly what the parsers read", () => {
+  assert.match(Model.propfindDiscoveryBody(), /<D:current-user-principal\/><C:calendar-home-set\/>/)
+  assert.match(Model.propfindCalendarsBody(), /<D:displayname\/><D:resourcetype\/><C:supported-calendar-component-set\/>/)
+  assert.match(Model.propfindCalendarsBody(), /<A:calendar-color\/>/)
+  assert.equal(Model.utcStamp(Date.UTC(2026, 2, 8, 7, 5, 9)), "20260308T070509Z")
+  assert.match(Model.calendarQueryBody(0, 86400000), /<C:comp-filter name="VEVENT"><C:time-range start="19700101T000000Z" end="19700102T000000Z"\/>/)
 })
 
 // ---------------------------------------------------------- Calendar prefs --

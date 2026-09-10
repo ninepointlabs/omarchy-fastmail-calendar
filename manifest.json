@@ -5,7 +5,7 @@
   "version": "0.1.0",
   "author": "Ninepoint Labs",
   "license": "MIT",
-  "description": "Read-only native Omarchy calendar — Today, Week, Month and Year views with day detail — backed directly by Fastmail's JMAP API.",
+  "description": "Read-only native Omarchy calendar — Today, Week, Month and Year views with day detail — over CalDAV. Fastmail by default; any CalDAV server works.",
   "kinds": [
     "service",
     "bar-widget"
@@ -16,11 +16,12 @@
   },
   "barWidget": {
     "displayName": "Fastmail Calendar",
-    "description": "Today's date or next event from Fastmail, with a Today/Week/Month/Year calendar panel and read-only day detail.",
+    "description": "Today's date or next event from your CalDAV calendars (Fastmail by default), with a Today/Week/Month/Year calendar panel and read-only day detail.",
     "category": "Time",
     "aliases": [
       "calendar",
       "fastmail calendar",
+      "caldav",
       "agenda"
     ],
     "allowMultiple": false,
