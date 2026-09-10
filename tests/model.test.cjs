@@ -319,7 +319,7 @@ test("the setup script hides the password, checks the server first, and stores v
 })
 
 test("scripts that reach a floating terminal contain no ${...} expansions", () => {
-  // uwsm-app launches the terminal through systemd-run, which expands
+  // uwsm-app launches the terminal via a transient unit runner that expands
   // ${NAME} forms as environment variables before bash runs the text.
   for (const script of [Model.setupLaunchCommand("ninepointlabs.fastmail-calendar"), Model.setupCredentialsScript]) {
     assert.deepEqual(script.match(/\$\{[^}]*\}/g), null)
