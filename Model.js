@@ -1410,8 +1410,12 @@ function parseCalendarWindow(raw, rangeStartMs, rangeEndMs, calendarsById) {
 // ---------------------------------------------------------------------------
 
 var setupLockDirectoryName = "setup-lock"
+// No ${...} anywhere in a script that reaches a floating terminal: the
+// launcher goes through uwsm-app -> systemd-run, which expands ${NAME} forms
+// as environment variables (systemd >= 254, --expand-environment=yes by
+// default) before bash ever sees the text — ${server:-x} became "".
 var setupLockShell = "uid=$(id -u) || exit 76; "
-  + "runtime=${XDG_RUNTIME_DIR:-/run/user/$uid}; "
+  + "runtime=$XDG_RUNTIME_DIR; [ -n \"$runtime\" ] || runtime=/run/user/$uid; "
   + "[ -d \"$runtime\" ] && [ ! -L \"$runtime\" ] "
   + "&& [ \"$(stat -c %u -- \"$runtime\" 2>/dev/null)\" = \"$uid\" ] "
   + "&& [ \"$(stat -c %a -- \"$runtime\" 2>/dev/null)\" = 700 ] || exit 76; "
@@ -1450,7 +1454,7 @@ var setupCredentialsScript = "set -eu; clear 2>/dev/null || true; "
   + "while IFS= read -rsn 1 -t 0.2 _; do :; done; "
   + "strip_term() { sed -E 's/\\x1b\\][^\\x07\\x1b]*(\\x07|\\x1b\\\\)//g; s/\\x1b\\[[0-9;?]*[ -\\/]*[@-~]//g' | tr -d '[:cntrl:]'; }; "
   + "printf '%s' 'Server URL [" + defaultServerUrl + "]: '; IFS= read -r server; "
-  + "server=$(printf '%s' \"$server\" | strip_term | tr -d '[:space:]'); server=${server:-" + defaultServerUrl + "}; server=${server%/}; "
+  + "server=$(printf '%s' \"$server\" | strip_term | tr -d '[:space:]' | sed 's,/*$,,'); [ -n \"$server\" ] || server=" + defaultServerUrl + "; "
   + "case \"$server\" in https://*) : ;; *) printf '%s\\n' 'The server URL must start with https://'; exit 1;; esac; "
   + "case \"$server\" in *[\\\"\\'\\\\\\`\\<\\>]*|*[[:cntrl:]]*) printf '%s\\n' 'That server URL has unexpected characters.'; exit 1;; esac; "
   + "printf '%s' 'Username (usually your email address): '; IFS= read -r username; "
@@ -1464,7 +1468,7 @@ var setupCredentialsScript = "set -eu; clear 2>/dev/null || true; "
   + "cfg=$(printf 'user = \"%s:%s\"\\n' \"$(esc \"$username\")\" \"$(esc \"$password\")\"); "
   + "probe() { url=$1; n=0; while :; do "
   + "out=$(printf '%s\\n' \"$cfg\" | curl -sS --max-time 20 --proto =https --max-redirs 0 -K - -o /dev/null -w '%{http_code} %{redirect_url}' -X PROPFIND -H 'Depth: 0' \"$url\") || { printf '%s\\n' \"Could not reach $url\"; exit 1; }; "
-  + "code=${out%% *}; redirect=${out#* }; "
+  + "code=$(printf '%s' \"$out\" | cut -d ' ' -f 1); redirect=$(printf '%s' \"$out\" | cut -d ' ' -f 2-); "
   + "case \"$code\" in 301|302|303|307|308) "
   + "case \"$redirect\" in https://*) : ;; *) printf '%s\\n' 'The server redirected somewhere that is not https.'; exit 1;; esac; "
   + "n=$((n + 1)); if [ \"$n\" -gt " + maxDiscoveryRedirects + " ]; then printf '%s\\n' 'Too many redirects.'; exit 1; fi; url=$redirect; continue;; esac; break; done; }; "

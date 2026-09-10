@@ -318,6 +318,14 @@ test("the setup script hides the password, checks the server first, and stores v
   assert.match(script, new RegExp("\\[" + Model.defaultServerUrl.replace(/[.\/]/g, "\\$&") + "\\]"))
 })
 
+test("scripts that reach a floating terminal contain no ${...} expansions", () => {
+  // uwsm-app launches the terminal through systemd-run, which expands
+  // ${NAME} forms as environment variables before bash runs the text.
+  for (const script of [Model.setupLaunchCommand("ninepointlabs.fastmail-calendar"), Model.setupCredentialsScript]) {
+    assert.deepEqual(script.match(/\$\{[^}]*\}/g), null)
+  }
+})
+
 test("setupLaunchCommand wraps the credentials script in the lock/trap/completion structure", () => {
   const command = Model.setupLaunchCommand("ninepointlabs.fastmail-calendar")
   assert.match(command, /flock -n 9/)
