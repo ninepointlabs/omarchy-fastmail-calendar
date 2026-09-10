@@ -28,7 +28,9 @@
     "defaultSection": "right",
     "defaults": {
       "view": "month",
-      "showNextEvent": true
+      "showNextEvent": true,
+      "showTime": false,
+      "timeFormat": "12-hour"
     },
     "schema": [
       {
@@ -36,6 +38,22 @@
         "type": "boolean",
         "label": "Show next event in bar",
         "defaultValue": true
+      },
+      {
+        "key": "showTime",
+        "type": "boolean",
+        "label": "Show time in bar",
+        "defaultValue": false
+      },
+      {
+        "key": "timeFormat",
+        "type": "enum",
+        "label": "Time format",
+        "options": [
+          "12-hour",
+          "24-hour"
+        ],
+        "defaultValue": "12-hour"
       },
       {
         "key": "view",

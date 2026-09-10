@@ -226,6 +226,23 @@ test("nextEventLabel picks the soonest upcoming event", () => {
   assert.match(Model.nextEventLabel(events, now), /Soon$/)
 })
 
+test("barLabelFormat appends the time only when asked and not already present", () => {
+  assert.equal(Model.barLabelFormat("ddd d MMM", false, "12-hour", false), "ddd d MMM")
+  assert.equal(Model.barLabelFormat("ddd d MMM", true, "12-hour", false), "ddd d MMM  h:mm ap")
+  assert.equal(Model.barLabelFormat("dddd, MMMM d", true, "24-hour", false), "dddd, MMMM d  HH:mm")
+  assert.equal(Model.barLabelFormat("ddd\n—\nd", true, "12-hour", true), "ddd\n—\nd\nh\nmm\nap")
+  assert.equal(Model.barLabelFormat("dd\nMMM", true, "24-hour", true), "dd\nMMM\nHH\nmm")
+  // The vertical time-only preset and a hand-edited format already show the hour.
+  assert.equal(Model.barLabelFormat("HH\n—\nmm", true, "12-hour", true), "HH\n—\nmm")
+  assert.equal(Model.barLabelFormat("ddd d MMM hh:mm", true, "24-hour", false), "ddd d MMM hh:mm")
+  // A quoted literal containing h is text, not an hour token.
+  assert.equal(Model.barLabelFormat("'the' d MMM", true, "24-hour", false), "'the' d MMM  HH:mm")
+  assert.equal(Model.barLabelFormat("", true, "12-hour", false), "h:mm ap")
+  // Anything that is not a known style falls back to 12-hour.
+  assert.equal(Model.normalizedTimeStyle("bogus"), "12-hour")
+  assert.equal(Model.timeOnlyFormat(undefined, false), "h:mm ap")
+})
+
 // --------------------------------------------------------- Text sanitization --
 
 test("cleanText strips control and invisible characters and collapses whitespace", () => {

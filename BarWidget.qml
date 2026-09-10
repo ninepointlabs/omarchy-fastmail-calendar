@@ -46,8 +46,17 @@ BarWidget {
       root.bar.shell.updateEntryInline(root.moduleName, entry)
   }
 
-  readonly property string dateText: Qt.formatDateTime(today, configuredFormat)
-  readonly property string displayText: nextEvent !== "" ? nextEvent : dateText
+  // ---- Time. Off by default; when on, the current time follows the date
+  // (and, when the chip is showing the next event instead, leads it) in the
+  // same 12-hour style as the panel's event labels unless set to 24-hour.
+  readonly property bool showTime: setting("showTime", false) === true
+  readonly property string timeStyle: Model.normalizedTimeStyle(setting("timeFormat", "12-hour"))
+  readonly property string labelFormat: Model.barLabelFormat(configuredFormat, showTime, timeStyle, vertical)
+  readonly property string timeText: showTime ? Qt.formatDateTime(today, Model.timeOnlyFormat(timeStyle, false)) : ""
+
+  readonly property string dateText: Qt.formatDateTime(today, labelFormat)
+  readonly property string displayText: nextEvent === "" ? dateText
+    : (timeText === "" ? nextEvent : timeText + " — " + nextEvent)
   readonly property var verticalLines: dateText.split("\n")
 
   function refresh() {

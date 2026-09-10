@@ -1824,6 +1824,36 @@ function nextEventLabel(events, nowMs) {
   return time === "" ? best.title : time + " · " + best.title
 }
 
+// ---- Bar label: the date format the user picked (right-click cycles it)
+// plus, when the "Show time in bar" setting is on, the current time in the
+// same 12-hour style the panel's event labels use ("1:05 pm"), or 24-hour.
+// A format that already carries an hour token (the vertical "HH\n—\nmm"
+// preset, or a hand-edited shell.json) is left alone rather than doubled.
+
+var timeStyles = ["12-hour", "24-hour"]
+
+function normalizedTimeStyle(value) {
+  return timeStyles.indexOf(String(value)) >= 0 ? String(value) : "12-hour"
+}
+
+function timeOnlyFormat(timeStyle, vertical) {
+  if (normalizedTimeStyle(timeStyle) === "24-hour") return vertical ? "HH\nmm" : "HH:mm"
+  return vertical ? "h\nmm\nap" : "h:mm ap"
+}
+
+function formatShowsTime(format) {
+  var unquoted = String(format || "").replace(/'[^']*'/g, "")
+  return /(^|[^A-Za-z])(HH?|hh?)($|[^A-Za-z])/.test(unquoted)
+}
+
+function barLabelFormat(baseFormat, showTime, timeStyle, vertical) {
+  var base = String(baseFormat || "")
+  if (showTime !== true || formatShowsTime(base)) return base
+  var time = timeOnlyFormat(timeStyle, vertical)
+  if (base === "") return time
+  return vertical ? base + "\n" + time : base + "  " + time
+}
+
 // ---------------------------------------------------------------------------
 // Calendar selection / color / visibility persistence — stable-id keyed, so
 // the choice survives a calendar list re-fetch even if Fastmail reorders it.
@@ -1967,6 +1997,8 @@ if (typeof module !== "undefined") {
     setupCredentialsScript: setupCredentialsScript, setupPlan: setupPlan,
     eventStartKey: eventStartKey, eventsByDay: eventsByDay, eventsOnDay: eventsOnDay,
     eventTimeLabel: eventTimeLabel, eventTimeRangeLabel: eventTimeRangeLabel, nextEventLabel: nextEventLabel,
+    timeStyles: timeStyles, normalizedTimeStyle: normalizedTimeStyle, timeOnlyFormat: timeOnlyFormat,
+    formatShowsTime: formatShowsTime, barLabelFormat: barLabelFormat,
     calendarColorIndex: calendarColorIndex, fallbackCalendarColor: fallbackCalendarColor, calendarColorPalette: calendarColorPalette,
     parseCalendarPrefs: parseCalendarPrefs, serializeCalendarPrefs: serializeCalendarPrefs,
     mergeCalendarPrefs: mergeCalendarPrefs, visibleCalendarIds: visibleCalendarIds
