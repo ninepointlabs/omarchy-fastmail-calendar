@@ -1,0 +1,12 @@
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const vm = require('node:vm');
+const model = {};
+vm.createContext(model);
+vm.runInContext(fs.readFileSync(require('node:path').join(__dirname, '../Model.js'), 'utf8'), model);
+assert.equal(model.monthGrid(2026, 2, 1, '2026-03-08').length, 6);
+assert.equal(model.monthGrid(2026, 2, 1, '2026-03-08').flatMap(w => w.days).length, 42);
+assert.equal(model.weekDays(new Date(2026, 2, 8), 1, '2026-03-08').length, 7);
+assert.equal(model.stepMonth(2026, 11, 1).year, 2027);
+assert.equal(model.isoWeek(2026, 0, 1), 1);
+console.log('PASS: five calendar-grid assertions');
