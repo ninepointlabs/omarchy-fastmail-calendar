@@ -14,6 +14,39 @@ const assert = require("node:assert/strict")
 const Model = require("../Model.js")
 const B = "0123456789abcdef" // a fixed response-framing boundary for the tests
 
+// A resolved trusted-tool table, the way Service.qml's startup probe builds
+// one. Every command builder takes this: without it they return an empty
+// command, which is the fail-closed path exercised further down.
+const TOOLS = {}
+for (const name of Model.requiredExecutables.concat(Model.optionalExecutables)) TOOLS[name] = "/usr/bin/" + name
+for (const name of Model.requiredOmarchyCommands) TOOLS[name] = "/usr/share/omarchy/bin/" + name
+
+// Every external tool named in the reviewed attack surface. A generated
+// script may only ever name these as an absolute path.
+const BOUND_TOOLS = Model.requiredExecutables.concat(Model.optionalExecutables, Model.requiredOmarchyCommands)
+
+// A generated script may never name one of those tools bare: every one has to
+// appear as an absolute path out of the table. This walks the script's tokens
+// and flags any bound tool name standing in *command* position — first token,
+// after a separator that starts a new command, or as the program argument of
+// an exec wrapper (setpriv/setsid). A name in argument position, like
+// `secret-tool clear`, is a subcommand and not a lookup.
+const COMMAND_OPENERS = ["then", "do", "else", "exec", "{", "(", "&&", "||", "|", ";", "!"]
+const EXEC_WRAPPERS = /(^|\/)(setsid|setpriv|env|nohup|nice|timeout)$/
+
+function bareInvocations(script) {
+  const tokens = String(script).split(/\s+/)
+  const hits = new Set()
+  for (let i = 0; i < tokens.length; i++) {
+    if (!BOUND_TOOLS.includes(tokens[i])) continue
+    const prev = i === 0 ? "" : tokens[i - 1]
+    const opensCommand = i === 0 || COMMAND_OPENERS.includes(prev) || /[;&|({]$/.test(prev)
+    const wrapsCommand = EXEC_WRAPPERS.test(prev) || tokens[i - 2] === "--pdeathsig"
+    if (opensCommand || wrapsCommand) hits.add(tokens[i])
+  }
+  return [...hits].sort()
+}
+
 // --------------------------------------------------------------- Grid/date --
 
 test("monthGrid is always six full weeks", () => {
@@ -288,68 +321,275 @@ test("parseAccountInfo reads only the server and username attributes", () => {
   assert.deepEqual(Model.parseAccountInfo("attribute.server = http://plain\n"), { server: "", username: "" })
 })
 
+// ------------------------------------------------ Trusted tool resolution --
+
+test("validAbsoluteExecutable takes only a plain name inside a trusted directory", () => {
+  assert.equal(Model.validAbsoluteExecutable("/usr/bin/curl"), "/usr/bin/curl")
+  assert.equal(Model.validAbsoluteExecutable("/bin/bash"), "/bin/bash")
+  assert.equal(Model.validAbsoluteExecutable("/run/current-system/sw/bin/sed"), "/run/current-system/sw/bin/sed")
+  assert.equal(Model.validAbsoluteExecutable("/usr/share/omarchy/bin/omarchy-shell"), "/usr/share/omarchy/bin/omarchy-shell")
+  // Not a trusted directory: the usual places a shadow binary lands.
+  assert.equal(Model.validAbsoluteExecutable("/usr/local/bin/curl"), "")
+  assert.equal(Model.validAbsoluteExecutable("/home/someone/bin/curl"), "")
+  assert.equal(Model.validAbsoluteExecutable("/tmp/curl"), "")
+  // Not absolute, so it would resolve through PATH.
+  assert.equal(Model.validAbsoluteExecutable("curl"), "")
+  assert.equal(Model.validAbsoluteExecutable("./curl"), "")
+  // Traversal back out of a trusted directory, and a nested path under one.
+  assert.equal(Model.validAbsoluteExecutable("/usr/bin/../../tmp/curl"), "")
+  assert.equal(Model.validAbsoluteExecutable("/usr/bin/sub/curl"), "")
+  // Anything that could end a quoting context once written into a script.
+  for (const hostile of ["/usr/bin/cu rl", "/usr/bin/cu'rl", "/usr/bin/cu\"rl", "/usr/bin/cu$rl",
+                         "/usr/bin/cu;rl", "/usr/bin/cu\nrl", "/usr/bin/cu`rl"])
+    assert.equal(Model.validAbsoluteExecutable(hostile), "", hostile)
+  assert.equal(Model.validAbsoluteExecutable("/usr/bin/" + "c".repeat(300)), "")
+  assert.equal(Model.validAbsoluteExecutable(undefined), "")
+})
+
+test("the tool probe searches only the fixed directories, using shell builtins", () => {
+  const script = Model.toolResolutionScript()
+  // Bare names appear here as loop *data*, never as a command to run: the
+  // only things executed are `for`, `[` and `printf`, which are builtins and
+  // so cannot be shadowed by a PATH entry.
+  assert.match(script, /^PATH=\/usr\/bin:/)
+  assert.match(script, /for d in \/usr\/bin \/bin \/usr\/sbin \/sbin \/run\/current-system\/sw\/bin; do/)
+  assert.match(script, /if \[ -x "\$d\/\$n" \]; then printf/)
+  assert.doesNotMatch(script, /command -v/)
+  assert.doesNotMatch(script, /\bwhich\b/)
+  assert.doesNotMatch(script, /type -p/)
+  for (const name of Model.requiredExecutables.concat(Model.requiredOmarchyCommands))
+    assert.ok(script.includes(" " + name + " ") || script.includes(" " + name + ";"), "probes for " + name)
+  // Only an absolute candidate can be the probe's own shell.
+  assert.deepEqual(Model.toolResolutionCommand("bash"), [])
+  assert.deepEqual(Model.toolResolutionCommand("/tmp/bash"), [])
+  assert.equal(Model.toolResolutionCommand("/usr/bin/bash")[0], "/usr/bin/bash")
+  for (const candidate of Model.bashCandidates)
+    assert.equal(Model.validAbsoluteExecutable(candidate), candidate)
+})
+
+test("parseToolTable keeps trusted paths and fails closed on anything else", () => {
+  const lines = Object.entries(TOOLS).map(([name, path]) => name + " " + path).join("\n")
+  const table = Model.parseToolTable(lines + "\n")
+  assert.equal(table.ok, true)
+  assert.deepEqual(table.missing, [])
+  assert.equal(table.tools.curl, "/usr/bin/curl")
+
+  // One required tool absent: no partial table, and a message naming it.
+  const without = Model.parseToolTable(lines.split("\n").filter(l => !l.startsWith("curl ")).join("\n"))
+  assert.equal(without.ok, false)
+  assert.deepEqual(without.missing, ["curl"])
+  assert.match(without.error, /curl/)
+
+  // A probe line pointing outside the trusted directories is dropped, not
+  // trusted — the tool then reads as missing.
+  const shadowed = Model.parseToolTable(lines.replace("curl /usr/bin/curl", "curl /home/someone/bin/curl"))
+  assert.equal(shadowed.ok, false)
+  assert.deepEqual(shadowed.missing, ["curl"])
+
+  assert.equal(Model.parseToolTable("").ok, false)
+  assert.equal(Model.toolsResolved({}), false)
+  assert.equal(Model.toolsResolved(TOOLS), true)
+  // The optional one never blocks a run.
+  const noClear = Object.assign({}, TOOLS)
+  delete noClear.clear
+  assert.equal(Model.toolsResolved(noClear), true)
+})
+
+test("every command builder returns nothing until the tool table resolves", () => {
+  for (const build of [
+    tools => Model.boundedCaptureCommand(tools, ["/usr/bin/curl"]),
+    tools => Model.secretLookupCommand(tools),
+    tools => Model.secretClearCommand(tools),
+    tools => Model.accountInfoCommand(tools),
+    tools => Model.caldavRequestCommand(tools, "PROPFIND", "0", "https://x.example/", "<x/>", B),
+    tools => Model.caldavWindowCommand(tools, "https://x.example", ["/dav/a/"], 0, 1, B),
+    tools => Model.caldavPutCommand(tools, "https://x.example/a.ics", "BEGIN:VCALENDAR", B),
+    tools => Model.setupLockCheckCommand(tools),
+    tools => Model.setupLaunchCommand(tools, "ninepointlabs.fastmail-calendar")
+  ]) {
+    assert.deepEqual(build({}), [], "empty table")
+    assert.deepEqual(build(undefined), [], "no table")
+    // A table carrying an untrusted path is no better than an empty one.
+    const shadowed = Object.assign({}, TOOLS, { bash: "/home/someone/bin/bash" })
+    assert.deepEqual(build(shadowed), [], "untrusted bash")
+    assert.ok(build(TOOLS).length > 0, "resolved table")
+  }
+  // Likewise the script builders, which the command builders read.
+  for (const build of [Model.boundedCaptureScript, Model.accountInfoShell, Model.caldavCredentialShell,
+                       Model.caldavRequestShell, Model.caldavWindowShell, Model.caldavPutShell,
+                       Model.setupLockShell, Model.setupCredentialsScript, Model.curlBase, Model.curlCommon])
+    assert.equal(build({}), "")
+  assert.equal(Model.setupLaunchScript({}, "x"), "")
+})
+
+test("the bounded-capture guard is built entirely from absolute paths", () => {
+  const command = Model.boundedCaptureCommand(TOOLS, ["/usr/bin/secret-tool", "lookup"])
+  assert.equal(command[0], "/usr/bin/setpriv")
+  assert.deepEqual(command.slice(1, 7), ["--pdeathsig", "TERM", "/usr/bin/bash", "-o", "pipefail", "-c"])
+  const script = command[7]
+  // The output cap, the process-group kill and the deadline all run through
+  // the table; `kill` and `wait` are bash builtins, which take precedence
+  // over PATH and so are not shadowable.
+  assert.match(script, /\/usr\/bin\/head -c "\$\(\(stdout_limit \+ 1\)\)"/)
+  assert.match(script, /\/usr\/bin\/head -c "\$\(\(stderr_limit \+ 1\)\)" >&2/)
+  assert.match(script, /\/usr\/bin\/setpriv --pdeathsig KILL \/usr\/bin\/setsid "\$@"/)
+  assert.match(script, /\/usr\/bin\/setpriv --pdeathsig KILL \/usr\/bin\/setsid \/usr\/bin\/bash -c/)
+  assert.match(script, /\/usr\/bin\/sleep 0\.1/)
+  assert.match(script, new RegExp("^PATH=" + Model.trustedPathEnvironment.replace(/[./]/g, "\\$&") + "; export PATH; "))
+  assert.deepEqual(bareInvocations(script), [])
+  // The captured command's own program has to be absolute and trusted too.
+  assert.deepEqual(Model.boundedCaptureCommand(TOOLS, ["curl", "-sS"]), [])
+  assert.deepEqual(Model.boundedCaptureCommand(TOOLS, ["/usr/local/bin/curl"]), [])
+  assert.deepEqual(Model.boundedCaptureCommand(TOOLS, []), [])
+  // Behavior the boundary depends on is unchanged.
+  assert.deepEqual(command.slice(8, 13), ["fmcal-output-guard", "1048576", "65536", "25", "2"])
+  assert.equal(Model.boundedCaptureCommand(TOOLS, ["/usr/bin/curl"], 4096, 512, 0, 7)[12], "7")
+  assert.equal(Model.boundedCaptureCommand(TOOLS, ["/usr/bin/curl"], 4096, 512, 0, 7)[11], "0")
+})
+
+test("no generated script names a bound tool without its absolute path", () => {
+  const scripts = {
+    boundedCapture: Model.boundedCaptureScript(TOOLS),
+    accountInfo: Model.accountInfoShell(TOOLS),
+    credentials: Model.caldavCredentialShell(TOOLS),
+    request: Model.caldavRequestShell(TOOLS),
+    window: Model.caldavWindowShell(TOOLS),
+    put: Model.caldavPutShell(TOOLS),
+    setupLock: Model.setupLockCheckCommand(TOOLS)[2],
+    setupCredentials: Model.setupCredentialsScript(TOOLS),
+    setupLaunch: Model.setupLaunchScript(TOOLS, "ninepointlabs.fastmail-calendar")
+  }
+  for (const [name, script] of Object.entries(scripts)) {
+    assert.deepEqual(bareInvocations(script), [], name + " resolves a tool through PATH")
+    // PATH is pinned as well, so anything reached indirectly still cannot
+    // come from a user-writable directory.
+    assert.ok(script.includes("PATH=/usr/bin:"), name + " does not pin PATH")
+    assert.doesNotMatch(script, /\bcommand -v\b/, name)
+    assert.doesNotMatch(script, /\bwhich\b/, name)
+  }
+  // The detector has to be able to fail: a script naming a tool bare is caught.
+  assert.deepEqual(bareInvocations("curl -sS https://x; sed -n 1p"), ["curl", "sed"])
+  assert.deepEqual(bareInvocations("/usr/bin/setpriv --pdeathsig KILL setsid /usr/bin/bash"), ["setsid"])
+  // A tool name in argument position is a subcommand, not a lookup.
+  assert.deepEqual(bareInvocations("/usr/bin/secret-tool clear service x"), [])
+})
+
+test("minimalEnvironment pins PATH and the locale and drops everything else", () => {
+  const environment = Model.minimalEnvironment({
+    XDG_RUNTIME_DIR: "/run/user/1000",
+    DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/user/1000/bus",
+    HOME: "/home/someone",
+    USER: "someone",
+    // None of these may survive into a process handling the app password.
+    PATH: "/home/someone/evil:/usr/bin",
+    LD_PRELOAD: "/home/someone/evil.so",
+    LD_LIBRARY_PATH: "/home/someone/lib",
+    http_proxy: "http://127.0.0.1:8080",
+    https_proxy: "http://127.0.0.1:8080",
+    CURL_HOME: "/home/someone",
+    CURL_CA_BUNDLE: "/home/someone/ca.pem",
+    SSL_CERT_FILE: "/home/someone/ca.pem",
+    BASH_ENV: "/home/someone/rc",
+    IFS: ":",
+    LC_ALL: "en_US.UTF-8"
+  })
+  assert.deepEqual(Object.keys(environment).sort(),
+    ["DBUS_SESSION_BUS_ADDRESS", "HOME", "LC_ALL", "PATH", "USER", "XDG_RUNTIME_DIR"])
+  assert.equal(environment.PATH, Model.trustedPathEnvironment)
+  assert.equal(environment.LC_ALL, "C")
+  assert.equal(environment.HOME, "/home/someone")
+  // No user-writable entry anywhere on the PATH a subprocess sees.
+  for (const directory of environment.PATH.split(":"))
+    assert.ok(Model.trustedBinaryDirectories.includes(directory), directory)
+  assert.ok(!environment.PATH.split(":").some(d => /^(\/home|\/tmp|\/usr\/local)/.test(d)))
+  // A value that could inject a second variable, or is not a value at all.
+  const hostile = Model.minimalEnvironment({ HOME: "/home/a\nLD_PRELOAD=/evil.so", USER: { a: 1 }, XDG_RUNTIME_DIR: "" })
+  assert.deepEqual(Object.keys(hostile).sort(), ["LC_ALL", "PATH"])
+  assert.deepEqual(Object.keys(Model.minimalEnvironment(undefined)).sort(), ["LC_ALL", "PATH"])
+  // The launcher's PATH still carries only trusted directories.
+  for (const directory of Model.trustedSessionPathEnvironment.split(":"))
+    assert.ok(Model.trustedBinaryDirectories.includes(directory) || directory === "/usr/share/omarchy/bin", directory)
+})
+
+test("no trusted directory is user-writable by convention", () => {
+  for (const directory of Model.trustedBinaryDirectories.concat(Model.trustedOmarchyDirectories))
+    assert.ok(/^\/(usr|bin|sbin|run)\//.test(directory + "/"), directory)
+  assert.ok(!Model.trustedBinaryDirectories.includes("/usr/local/bin"))
+  assert.ok(!Model.trustedBinaryDirectories.some(d => d.startsWith("/home") || d.startsWith("/tmp")))
+})
+
 test("secretLookupCommand and secretClearCommand are fixed argv with no secret value", () => {
-  const expected = { lookup: Model.secretLookupCommand(), clear: Model.secretClearCommand() }
+  const expected = { lookup: Model.secretLookupCommand(TOOLS), clear: Model.secretClearCommand(TOOLS) }
   for (const [verb, command] of Object.entries(expected)) {
     assert.deepEqual(command.slice(-6),
-      ["secret-tool", verb, "service", Model.secretService, "account", Model.secretAccount])
-    const tail = command.slice(command.indexOf("secret-tool"))
+      [TOOLS["secret-tool"], verb, "service", Model.secretService, "account", Model.secretAccount])
+    const tail = command.slice(command.indexOf(TOOLS["secret-tool"]))
     assert.ok(tail.every(part => !/[$<>{}]/.test(part)), "no placeholder or interpolation in " + verb)
   }
 })
 
 test("the account-info command only lets attribute lines through", () => {
-  assert.match(Model.accountInfoShell, /secret-tool search/)
-  assert.match(Model.accountInfoShell, /grep '\^attribute\\\.'/)
+  const shell = Model.accountInfoShell(TOOLS)
+  assert.match(shell, /\/usr\/bin\/secret-tool search/)
+  assert.match(shell, /\/usr\/bin\/grep '\^attribute\\\.'/)
+  assert.deepEqual(bareInvocations(shell), [])
 })
 
 test("the CalDAV request scripts take the password from the keyring, never from argv", () => {
-  const command = Model.caldavRequestCommand("PROPFIND", "0", "https://caldav.fastmail.com/.well-known/caldav", "<x/>", B)
+  const command = Model.caldavRequestCommand(TOOLS, "PROPFIND", "0", "https://caldav.fastmail.com/.well-known/caldav", "<x/>", B)
   assert.deepEqual(command.slice(-5), ["PROPFIND", "0", "https://caldav.fastmail.com/.well-known/caldav", "<x/>", B])
-  for (const script of [Model.caldavRequestShell, Model.caldavWindowShell]) {
-    assert.match(script, /secret-tool lookup/)
-    assert.match(script, /curl -sS --max-time 25 --proto =https --max-redirs 0 -K -/)
+  for (const script of [Model.caldavRequestShell(TOOLS), Model.caldavWindowShell(TOOLS)]) {
+    assert.match(script, /\/usr\/bin\/secret-tool lookup/)
+    assert.match(script, /\/usr\/bin\/curl -q -sS --max-time 25 --proto =https --max-redirs 0 -K -/)
     assert.doesNotMatch(script, /-u\s/)
     assert.doesNotMatch(script, /--user\s/)
     assert.match(script, /unset password/)
+    assert.deepEqual(bareInvocations(script), [])
   }
-  const window = Model.caldavWindowCommand("https://caldav.fastmail.com", ["/dav/a/", "/dav/b/"], Date.UTC(2026, 2, 1), Date.UTC(2026, 3, 1), B)
+  const window = Model.caldavWindowCommand(TOOLS, "https://caldav.fastmail.com", ["/dav/a/", "/dav/b/"], Date.UTC(2026, 2, 1), Date.UTC(2026, 3, 1), B)
   assert.deepEqual(window.slice(-3), [B, "/dav/a/", "/dav/b/"])
   assert.match(window[window.length - 4], /<C:time-range start="20260301T000000Z" end="20260401T000000Z"\/>/)
 })
 
 test("the setup script hides the password, checks the server first, and stores via stdin", () => {
-  const script = Model.setupCredentialsScript
-  assert.match(script, /stty -echo/)
+  const script = Model.setupCredentialsScript(TOOLS)
+  assert.match(script, /\/usr\/bin\/stty -echo/)
   // Queued terminal query replies must be drained before the first read and
   // any escape residue stripped, or they answer the server prompt.
   assert.ok(script.indexOf("read -rsn 1 -t 0.2 _") < script.indexOf("read -r server"))
-  assert.match(script, /strip_term\(\) \{ sed -E/)
+  assert.match(script, /strip_term\(\) \{ \/usr\/bin\/sed -E/)
   assert.match(script, /"\$server" \| strip_term/)
   assert.match(script, /"\$username" \| strip_term/)
-  assert.match(script, /curl -sS --max-time 20 --proto =https --max-redirs 0 -K -/)
-  assert.match(script, /secret-tool clear service/)
-  assert.match(script, /printf '%s' "\$password" \| secret-tool store/)
+  assert.match(script, /\/usr\/bin\/curl -q -sS --max-time 20 --proto =https --max-redirs 0 -K -/)
+  assert.match(script, /\/usr\/bin\/secret-tool clear service/)
+  assert.match(script, /printf '%s' "\$password" \| \/usr\/bin\/secret-tool store/)
   assert.match(script, /server "\$server" username "\$username"/)
   assert.doesNotMatch(script, /echo\s+"?\$password/)
   assert.ok(script.indexOf("Checking the server") < script.indexOf("secret-tool store"))
+  assert.deepEqual(bareInvocations(script), [])
   assert.match(script, new RegExp("\\[" + Model.defaultServerUrl.replace(/[.\/]/g, "\\$&") + "\\]"))
 })
 
 test("scripts that reach a floating terminal contain no ${...} expansions", () => {
   // uwsm-app launches the terminal via a transient unit runner that expands
   // ${NAME} forms as environment variables before bash runs the text.
-  for (const script of [Model.setupLaunchCommand("ninepointlabs.fastmail-calendar"), Model.setupCredentialsScript]) {
+  for (const script of [Model.setupLaunchScript(TOOLS, "ninepointlabs.fastmail-calendar"), Model.setupCredentialsScript(TOOLS)]) {
     assert.deepEqual(script.match(/\$\{[^}]*\}/g), null)
   }
 })
 
 test("setupLaunchCommand wraps the credentials script in the lock/trap/completion structure", () => {
-  const command = Model.setupLaunchCommand("ninepointlabs.fastmail-calendar")
-  assert.match(command, /flock -n 9/)
-  assert.match(command, /omarchy-shell -q "\$target" setupFinished/)
-  assert.match(command, /trap 'rc=\$\?; trap - EXIT; flock -u 9;/)
-  assert.ok(command.indexOf(Model.setupCredentialsScript) > 0)
+  const script = Model.setupLaunchScript(TOOLS, "ninepointlabs.fastmail-calendar")
+  assert.match(script, /\/usr\/bin\/flock -n 9/)
+  assert.match(script, /\/usr\/share\/omarchy\/bin\/omarchy-shell -q "\$target" setupFinished/)
+  assert.match(script, /trap 'rc=\$\?; trap - EXIT; \/usr\/bin\/flock -u 9;/)
+  assert.ok(script.indexOf(Model.setupCredentialsScript(TOOLS)) > 0)
+  assert.deepEqual(bareInvocations(script), [])
+  // An argument vector, never a shell-interpolated string: Panel.qml hands
+  // this straight to Quickshell.execDetached, so the script stays one literal
+  // argument that nothing re-tokenizes.
+  assert.deepEqual(Model.setupLaunchCommand(TOOLS, "ninepointlabs.fastmail-calendar"),
+    ["/usr/share/omarchy/bin/omarchy-launch-floating-terminal-with-presentation", script])
 })
 
 test("setupPlan distinguishes never-connected from rejected credentials", () => {
@@ -616,10 +856,12 @@ test("prepareNewEvent refuses unusable input with a reason", () => {
 })
 
 test("the PUT script refuses to overwrite and carries no secrets or ${...}", () => {
-  assert.match(Model.caldavPutShell, /-X PUT -H 'Content-Type: text\/calendar; charset=utf-8' -H 'If-None-Match: \*'/)
-  assert.match(Model.caldavPutShell, /secret-tool lookup/)
-  assert.match(Model.caldavPutShell, /--proto =https --max-redirs 0/)
-  const command = Model.caldavPutCommand("https://caldav.fastmail.com/dav/c/u.ics", "BEGIN:VCALENDAR", B)
+  const put = Model.caldavPutShell(TOOLS)
+  assert.match(put, /-X PUT -H 'Content-Type: text\/calendar; charset=utf-8' -H 'If-None-Match: \*'/)
+  assert.match(put, /\/usr\/bin\/secret-tool lookup/)
+  assert.match(put, /--proto =https --max-redirs 0/)
+  assert.deepEqual(bareInvocations(put), [])
+  const command = Model.caldavPutCommand(TOOLS, "https://caldav.fastmail.com/dav/c/u.ics", "BEGIN:VCALENDAR", B)
   assert.deepEqual(command.slice(-3), ["https://caldav.fastmail.com/dav/c/u.ics", "BEGIN:VCALENDAR", B])
 })
 
@@ -715,10 +957,11 @@ test("redirects are only followed within the configured server's domain", () => 
 })
 
 test("the setup script vets redirect hosts and warns on an anonymous 2xx", () => {
-  assert.match(Model.setupCredentialsScript, /rhost=\$\(printf/)
-  assert.match(Model.setupCredentialsScript, /outside its own domain/)
-  assert.match(Model.setupCredentialsScript, /did not ask for a password/)
-  assert.match(Model.setupCredentialsScript, /\*\[!A-Za-z0-9\._~:\/@%\+,\\;=!\\&-\]\*\)/)
+  const setup = Model.setupCredentialsScript(TOOLS)
+  assert.match(setup, /rhost=\$\(printf/)
+  assert.match(setup, /outside its own domain/)
+  assert.match(setup, /did not ask for a password/)
+  assert.match(setup, /\*\[!A-Za-z0-9\._~:\/@%\+,\\;=!\\&-\]\*\)/)
 })
 
 test("calendar prefs never serialize past what parsing reads back, and long ids persist", () => {
