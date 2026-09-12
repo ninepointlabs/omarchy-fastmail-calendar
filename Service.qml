@@ -70,7 +70,7 @@ Item {
   property bool mutating: false
   property string mutationError: ""
 
-  readonly property bool busy: probing || windowLoading || forgetProcess.running || mutating
+  readonly property bool busy: toolsProbing || probing || windowLoading || forgetProcess.running || mutating
 
   function setting(name, fallback) {
     var value = settings ? settings[name] : undefined
@@ -82,10 +82,119 @@ Item {
     return text.length > 200 ? text.substring(0, 197) + "…" : text
   }
 
+  // ------------------------------------------------- Trusted tool table --
+
+  // Every external program this plugin runs is bound to an absolute path in a
+  // fixed system directory (see Model.js's "Trusted executable resolution").
+  // The table is built once, here, by running Model.toolResolutionScript —
+  // a builtin-only script — under each absolute bash candidate in turn. Until
+  // it resolves, every command builder returns an empty command and nothing
+  // starts: no capture, no keyring read, no request, no setup. There is no
+  // PATH fallback at any point.
+  property var tools: ({})
+  property bool toolsReady: false
+  property bool toolsProbing: false
+  property string toolsError: ""
+  readonly property string missingToolMessage: toolsError !== "" ? toolsError
+    : "secret-tool (libsecret) and curl are required and should already be installed on Omarchy."
+
+  // The environment every subprocess gets in place of the session's own: a
+  // fixed PATH, a pinned locale, and only the session-bus handles libsecret
+  // needs to reach the keyring daemon. Nothing else the viewer's shell
+  // exported — LD_PRELOAD, http_proxy, CURL_HOME — is carried over.
+  readonly property var processEnvironment: Model.minimalEnvironment({
+    XDG_RUNTIME_DIR: Quickshell.env("XDG_RUNTIME_DIR"),
+    DBUS_SESSION_BUS_ADDRESS: Quickshell.env("DBUS_SESSION_BUS_ADDRESS"),
+    HOME: Quickshell.env("HOME"),
+    USER: Quickshell.env("USER")
+  })
+
+  readonly property var toolProbeEnvironment: Model.probeEnvironment()
+
+  property int _bashCandidate: 0
+  property bool _probeStarted: false
+  property bool _probeSettled: false
+  property string _probeOut: ""
+
+  function resolveTools() {
+    if (toolsReady || toolsProbing) return
+    _bashCandidate = 0
+    startToolProbe()
+  }
+
+  function startToolProbe() {
+    var candidates = Model.bashCandidates
+    if (_bashCandidate >= candidates.length) {
+      failToolResolution("No shell found in " + Model.trustedBinaryDirectories.join(", ")
+        + " — the calendar will not run commands through the session PATH")
+      return
+    }
+    var command = Model.toolResolutionCommand(candidates[_bashCandidate])
+    if (command.length === 0) { _bashCandidate++; startToolProbe(); return }
+    toolsProbing = true
+    _probeStarted = false
+    _probeSettled = false
+    _probeOut = ""
+    toolProbe.command = command
+    toolProbe.running = true
+  }
+
+  // Fail closed: the table stays empty, so every builder keeps returning an
+  // empty command, and the panel shows why instead of a bare "not connected".
+  function failToolResolution(message) {
+    toolsProbing = false
+    toolsReady = false
+    tools = ({})
+    toolsError = message
+    probed = true
+    probing = false
+    missingTool = true
+    hasCredentials = false
+    authenticated = false
+    lastError = conciseError(message, "Required tools are missing")
+  }
+
+  Process {
+    id: toolProbe
+    running: false
+    command: []
+    clearEnvironment: true
+    environment: root.toolProbeEnvironment
+    stdout: StdioCollector { id: toolProbeStdout; waitForEnd: true; onStreamFinished: root._probeOut = text }
+    onStarted: root._probeStarted = true
+    onExited: function(exitCode) {
+      if (root._probeSettled) return
+      root._probeSettled = true
+      // Started but said nothing usable, or never started at all: try the
+      // next absolute candidate rather than widening the search.
+      if (!root._probeStarted) { root._bashCandidate++; root.startToolProbe(); return }
+      var table = Model.parseToolTable(String(toolProbeStdout.text || root._probeOut || ""))
+      if (!table.ok) {
+        root.failToolResolution("The calendar needs tools it could not find. " + table.error)
+        return
+      }
+      root.toolsProbing = false
+      root.toolsError = ""
+      root.missingTool = false
+      root.tools = table.tools
+      root.toolsReady = true
+      if (root.active) root.refresh()
+    }
+    // A candidate that is not on disk never starts, so `running` falls back
+    // to false without an exit. Move on to the next candidate.
+    onRunningChanged: {
+      if (running || root._probeSettled || root._probeStarted) return
+      root._probeSettled = true
+      root._bashCandidate++
+      root.startToolProbe()
+    }
+  }
+
   // -------------------------------------------------------------- Probe --
 
   function refresh() {
     if (!active || probing) return
+    if (!toolsReady) { resolveTools(); return }
     probing = true
     probeError = false
     lastError = ""
@@ -131,7 +240,9 @@ Item {
   Process {
     id: accountProcess
     running: false
-    command: Model.accountInfoCommand()
+    clearEnvironment: true
+    environment: root.processEnvironment
+    command: Model.accountInfoCommand(root.tools)
     stdout: StdioCollector { id: accountStdout; waitForEnd: true; onStreamFinished: root._accountOut = text }
     onExited: function(exitCode) {
       var info
@@ -164,13 +275,15 @@ Item {
     _stepOut = ""
     _stepErr = ""
     _stepBoundary = Model.newBoundary()
-    stepProcess.command = Model.caldavRequestCommand(method, depth, url, body, _stepBoundary)
+    stepProcess.command = Model.caldavRequestCommand(tools, method, depth, url, body, _stepBoundary)
     stepProcess.running = true
   }
 
   Process {
     id: stepProcess
     running: false
+    clearEnvironment: true
+    environment: root.processEnvironment
     command: []
     stdout: StdioCollector { id: stepStdout; waitForEnd: true; onStreamFinished: root._stepOut = text }
     stderr: StdioCollector { id: stepStderr; waitForEnd: true; onStreamFinished: root._stepErr = text }
@@ -299,7 +412,7 @@ Item {
   // in this machine's own zone — the same zone every display computation
   // already reads dates in.
   function requestWindow(startKey, endKey, force) {
-    if (!active) return
+    if (!active || !toolsReady) return
     if (!force && startKey === windowStart && endKey === windowEnd && windowLoadedAtMs > 0) return
     windowStart = startKey
     windowEnd = endKey
@@ -323,7 +436,7 @@ Item {
     _windowRangeStartMs = rangeStartMs
     _windowRangeEndMs = rangeEndMs
     _windowBoundary = Model.newBoundary()
-    eventsProcess.command = Model.caldavWindowCommand(origin, hrefs, rangeStartMs, rangeEndMs, _windowBoundary)
+    eventsProcess.command = Model.caldavWindowCommand(tools, origin, hrefs, rangeStartMs, rangeEndMs, _windowBoundary)
     eventsProcess.running = true
   }
 
@@ -337,6 +450,8 @@ Item {
   Process {
     id: eventsProcess
     running: false
+    clearEnvironment: true
+    environment: root.processEnvironment
     command: []
     stdout: StdioCollector { id: eventsStdout; waitForEnd: true; onStreamFinished: root._eventsOut = text }
     stderr: StdioCollector { id: eventsStderr; waitForEnd: true; onStreamFinished: root._eventsErr = text }
@@ -389,7 +504,7 @@ Item {
     _putOut = ""
     _putErr = ""
     _putBoundary = Model.newBoundary()
-    putProcess.command = Model.caldavPutCommand(origin + prepared.href, prepared.body, _putBoundary)
+    putProcess.command = Model.caldavPutCommand(tools, origin + prepared.href, prepared.body, _putBoundary)
     putProcess.running = true
     return true
   }
@@ -401,6 +516,8 @@ Item {
   Process {
     id: putProcess
     running: false
+    clearEnvironment: true
+    environment: root.processEnvironment
     command: []
     stdout: StdioCollector { id: putStdout; waitForEnd: true; onStreamFinished: root._putOut = text }
     stderr: StdioCollector { id: putStderr; waitForEnd: true; onStreamFinished: root._putErr = text }
@@ -443,7 +560,7 @@ Item {
   // ------------------------------------------------------------- Setup --
 
   function tryStartSetup() {
-    if (setupRunning || setupChecking) return false
+    if (!toolsReady || setupRunning || setupChecking) return false
     setupRunning = true
     return true
   }
@@ -453,13 +570,16 @@ Item {
   }
 
   function checkSetupRunning() {
+    if (!toolsReady) return
     if (!setupLockProcess.running) setupLockProcess.running = true
   }
 
   Process {
     id: setupLockProcess
     running: false
-    command: Model.setupLockCheckCommand()
+    clearEnvironment: true
+    environment: root.processEnvironment
+    command: Model.setupLockCheckCommand(root.tools)
     onExited: function(exitCode) {
       root.setupRunning = exitCode === 1
       if (exitCode !== 0 && exitCode !== 1)
@@ -470,14 +590,16 @@ Item {
   // ---------------------------------------------------- Forget credentials --
 
   function forgetCredentials() {
-    if (forgetProcess.running) return
+    if (!toolsReady || forgetProcess.running) return
     forgetProcess.running = true
   }
 
   Process {
     id: forgetProcess
     running: false
-    command: Model.secretClearCommand()
+    clearEnvironment: true
+    environment: root.processEnvironment
+    command: Model.secretClearCommand(root.tools)
     onExited: function(exitCode) {
       root.hasCredentials = false
       root.authenticated = false

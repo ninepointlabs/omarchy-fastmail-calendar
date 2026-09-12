@@ -541,9 +541,173 @@ function exceedsUtf8ByteLimit(value, limit) {
 }
 
 // ---------------------------------------------------------------------------
+// Trusted executable resolution — every external program this plugin runs is
+// bound to an absolute path inside a fixed set of system directories and is
+// never resolved through the session's PATH. A shadow `curl`, `secret-tool`
+// or `head` earlier in the viewer's PATH therefore cannot see the app
+// password, alter a CalDAV destination, or bypass the capture guard's own
+// output and deadline controls.
+//
+// The table is built once at startup — Service.qml's tool probe runs
+// toolResolutionScript under each bashCandidate in turn — and is handed to
+// every command builder below. A required tool that is not present in a
+// trusted directory leaves the table incomplete, and every builder then
+// returns an empty command: the plugin refuses to run rather than falling
+// back to whatever PATH offers.
+// ---------------------------------------------------------------------------
+
+// Directories a system executable may be taken from. Deliberately excludes
+// /usr/local/bin and anything under $HOME — the usual landing spots for a
+// shadow binary, and nothing this plugin needs is installed there.
+var trustedBinaryDirectories = ["/usr/bin", "/bin", "/usr/sbin", "/sbin", "/run/current-system/sw/bin"]
+
+// Omarchy's own commands (the floating-terminal launcher, the IPC client)
+// ship in the Omarchy tree; the system directories are still preferred.
+var trustedOmarchyDirectories = ["/usr/bin", "/bin", "/usr/share/omarchy/bin", "/usr/local/share/omarchy/bin"]
+
+// A script cannot resolve the shell it has not started under, so the probe
+// walks these absolute candidates in order until one execs.
+var bashCandidates = ["/usr/bin/bash", "/bin/bash", "/run/current-system/sw/bin/bash"]
+
+// Every external tool on a capture, credential or setup path. Nothing runs
+// until all of them resolve. `kill`, `printf`, `read`, `wait`, `trap`, `[`
+// and `command` are bash builtins — builtins take precedence over PATH and
+// cannot be shadowed by a directory entry, so they are not listed here.
+var requiredExecutables = [
+  "bash", "setpriv", "setsid", "sleep", "head",
+  "secret-tool", "curl", "grep", "sed",
+  "tr", "cut", "awk", "stty",
+  "id", "stat", "mkdir", "chmod", "flock"
+]
+
+// Cosmetic only — setup clears the screen if it can and carries on if it
+// cannot, so a missing `clear` never blocks a run.
+var optionalExecutables = ["clear"]
+
+var requiredOmarchyCommands = ["omarchy-shell", "omarchy-launch-floating-terminal-with-presentation"]
+
+// The only PATH any subprocess this plugin starts ever sees.
+var trustedPathEnvironment = trustedBinaryDirectories.join(":")
+
+// The floating terminal's launcher is an Omarchy script that resolves its own
+// helpers (uwsm-app, xdg-terminal-exec, omarchy-show-logo) by name, so its
+// PATH has to carry the Omarchy tree as well — still no user-writable entry.
+var trustedSessionPathEnvironment = trustedBinaryDirectories.concat(["/usr/share/omarchy/bin"]).join(":")
+
+// The only session variables a subprocess inherits: what libsecret needs to
+// reach the keyring daemon over the session bus. Everything else is dropped.
+var inheritedEnvironmentNames = ["XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS", "HOME", "USER"]
+
+// A path is trusted only when it is a plain component inside one of the fixed
+// directories above: no relative segment, no whitespace, and no character
+// that could end a quoting context once it is written into a script.
+var trustedExecutablePattern = /^\/[A-Za-z0-9][A-Za-z0-9._+-]*(?:\/[A-Za-z0-9][A-Za-z0-9._+-]*)*$/
+
+function directoryIsTrusted(directory) {
+  var all = trustedBinaryDirectories.concat(trustedOmarchyDirectories)
+  for (var i = 0; i < all.length; i++) if (all[i] === directory) return true
+  return false
+}
+
+function validAbsoluteExecutable(value) {
+  var text = String(value === undefined || value === null ? "" : value)
+  if (text === "" || text.length > 256) return ""
+  if (!trustedExecutablePattern.test(text)) return ""
+  var slash = text.lastIndexOf("/")
+  if (slash <= 0) return ""
+  return directoryIsTrusted(text.substring(0, slash)) ? text : ""
+}
+
+// The one lookup every command builder goes through. An unresolved or
+// untrusted entry reads as "", and its builder then returns an empty command.
+function toolPath(tools, name) {
+  if (!tools || typeof tools !== "object" || Array.isArray(tools)) return ""
+  return validAbsoluteExecutable(tools[name])
+}
+
+function missingTools(tools) {
+  var names = requiredExecutables.concat(requiredOmarchyCommands)
+  var missing = []
+  for (var i = 0; i < names.length; i++) if (toolPath(tools, names[i]) === "") missing.push(names[i])
+  return missing
+}
+
+function toolsResolved(tools) {
+  return missingTools(tools).length === 0
+}
+
+// The probe script. It uses shell builtins only — `for`, `[`, `printf` — so
+// it cannot itself be steered by PATH, and prints one `name /abs/path` line
+// per tool found. A tool that is in none of its directories is simply absent
+// from the output, and parseToolTable then fails closed on it.
+function toolResolutionScript() {
+  return "PATH=" + trustedPathEnvironment + "; "
+    + "for n in " + requiredExecutables.concat(optionalExecutables).join(" ") + "; do "
+    + "for d in " + trustedBinaryDirectories.join(" ") + "; do "
+    + "if [ -x \"$d/$n\" ]; then printf '%s %s\\n' \"$n\" \"$d/$n\"; break; fi; "
+    + "done; done; "
+    + "for n in " + requiredOmarchyCommands.join(" ") + "; do "
+    + "for d in " + trustedOmarchyDirectories.join(" ") + "; do "
+    + "if [ -x \"$d/$n\" ]; then printf '%s %s\\n' \"$n\" \"$d/$n\"; break; fi; "
+    + "done; done"
+}
+
+function toolResolutionCommand(bashPath) {
+  var shell = validAbsoluteExecutable(bashPath)
+  return shell === "" ? [] : [shell, "-c", toolResolutionScript(), "fmcal-tool-probe"]
+}
+
+function parseToolTable(raw) {
+  var tools = {}
+  var lines = String(raw || "").split("\n")
+  for (var i = 0; i < lines.length && i < 128; i++) {
+    var match = lines[i].match(/^([a-z][a-z0-9-]{0,63}) (\/[^\s]+)$/)
+    if (!match) continue
+    var resolved = validAbsoluteExecutable(match[2])
+    if (resolved !== "" && tools[match[1]] === undefined) tools[match[1]] = resolved
+  }
+  var missing = missingTools(tools)
+  return {
+    ok: missing.length === 0,
+    tools: tools,
+    missing: missing,
+    error: missing.length === 0 ? ""
+      : "Not found in " + trustedBinaryDirectories.join(", ") + ": " + missing.join(", ")
+  }
+}
+
+// The environment every subprocess gets, in place of the session's own: a
+// fixed PATH, a pinned locale so tool output stays parseable, and nothing
+// else but the allow-listed session-bus handles — each refused unless it is a
+// plain single-line value.
+// The startup probe needs nothing but a fixed PATH and a pinned locale: it
+// reads no keyring and opens no socket.
+function probeEnvironment() {
+  return { PATH: trustedPathEnvironment, LC_ALL: "C" }
+}
+
+function minimalEnvironment(inherited) {
+  var environment = { PATH: trustedPathEnvironment, LC_ALL: "C" }
+  var source = inherited && typeof inherited === "object" && !Array.isArray(inherited) ? inherited : {}
+  for (var i = 0; i < inheritedEnvironmentNames.length; i++) {
+    var name = inheritedEnvironmentNames[i]
+    var value = source[name]
+    if (value === undefined || value === null || typeof value === "object") continue
+    var text = String(value)
+    if (text === "" || text.length > 4096) continue
+    if (/[\x00-\x1f\x7f]/.test(text)) continue
+    environment[name] = text
+  }
+  return environment
+}
+
+// ---------------------------------------------------------------------------
 // Bounded, hardened process invocation — output size caps, a timeout, and a
 // process-group kill on exit, adapted from omarchy-hey-calendar's Model.js
-// (itself from 37signals.hey's); see THIRD_PARTY_NOTICES.md.
+// (itself from 37signals.hey's); see THIRD_PARTY_NOTICES.md. Every control
+// tool the guard itself uses (setpriv, setsid, the nested shell, head, sleep)
+// comes from the resolved table, so the boundary is not built out of
+// anything the session PATH can reach.
 // ---------------------------------------------------------------------------
 
 var cliResponseByteLimit = 1024 * 1024
@@ -551,32 +715,57 @@ var cliErrorByteLimit = 64 * 1024
 var finiteCommandTimeoutSec = 25
 var finiteCommandKillGraceSec = 2
 
-var boundedCaptureScript = "stdout_limit=$1; stderr_limit=$2; deadline=$3; grace=$4; shift 4; child_pid=; timer_pid=; killer_pid=; timed_out=0; "
-  + "stop_timer() { if [ -n \"$timer_pid\" ]; then kill -TERM -- \"-$timer_pid\" 2>/dev/null || true; kill -TERM \"$timer_pid\" 2>/dev/null || true; wait \"$timer_pid\" 2>/dev/null || true; timer_pid=; fi; }; "
-  + "start_group_killer() { setpriv --pdeathsig KILL setsid bash -c 'end=$((SECONDS + $1)); while kill -0 -- \"-$2\" 2>/dev/null && [ \"$SECONDS\" -lt \"$end\" ]; do sleep 0.1; done; kill -KILL -- \"-$2\" 2>/dev/null || true' fmcal-output-killer \"$grace\" \"$child_pid\" & killer_pid=$!; }; "
-  + "wait_group_killer() { if [ -n \"$killer_pid\" ]; then wait \"$killer_pid\" 2>/dev/null || true; killer_pid=; fi; }; "
-  + "cleanup_group() { if [ -n \"$child_pid\" ] && kill -0 -- \"-$child_pid\" 2>/dev/null; then kill -TERM -- \"-$child_pid\" 2>/dev/null || true; start_group_killer; wait_group_killer; fi; }; "
-  + "terminate_child() { if [ -n \"$child_pid\" ]; then kill -TERM -- \"-$child_pid\" 2>/dev/null || true; kill -TERM \"$child_pid\" 2>/dev/null || true; start_group_killer; wait \"$child_pid\" 2>/dev/null || true; wait_group_killer; child_pid=; fi; }; "
-  + "stop_child() { trap - HUP INT TERM USR1; stop_timer; terminate_child; exit 143; }; "
-  + "trap 'timed_out=1' USR1; trap stop_child HUP INT TERM; "
-  + "setpriv --pdeathsig KILL setsid \"$@\" "
-  + "> >(head -c \"$((stdout_limit + 1))\") "
-  + "2> >(head -c \"$((stderr_limit + 1))\" >&2) & child_pid=$!; "
-  + "if [ \"$deadline\" -gt 0 ]; then parent_pid=$BASHPID; "
-  + "setpriv --pdeathsig KILL setsid bash -c 'sleep \"$1\" || exit 0; kill -USR1 \"$2\" 2>/dev/null || exit 0; kill -TERM -- \"-$3\" 2>/dev/null || true; kill -TERM \"$3\" 2>/dev/null || true; end=$((SECONDS + $4)); while kill -0 -- \"-$3\" 2>/dev/null && [ \"$SECONDS\" -lt \"$end\" ]; do sleep 0.1; done; if kill -0 -- \"-$3\" 2>/dev/null; then kill -KILL -- \"-$3\" 2>/dev/null || true; fi' "
-  + "fmcal-output-timeout \"$deadline\" \"$parent_pid\" \"$child_pid\" \"$grace\" & timer_pid=$!; fi; "
-  + "wait \"$child_pid\"; status=$?; "
-  + "if [ \"$timed_out\" -eq 1 ]; then wait \"$child_pid\" 2>/dev/null || true; status=124; wait \"$timer_pid\" 2>/dev/null || true; timer_pid=; "
-  + "else stop_timer; cleanup_group; fi; child_pid=; exit \"$status\""
+// The guard script. Everything it starts is an absolute path from the
+// resolved table; `kill`, `wait`, `trap` and `[` are bash builtins, which
+// take precedence over PATH and so cannot be shadowed. PATH is pinned as
+// well, so anything reached indirectly still cannot come from a user
+// directory.
+function boundedCaptureScript(tools) {
+  if (!toolsResolved(tools)) return ""
+  var setpriv = toolPath(tools, "setpriv")
+  var bash = toolPath(tools, "bash")
+  var setsid = toolPath(tools, "setsid")
+  var sleep = toolPath(tools, "sleep")
+  var head = toolPath(tools, "head")
+  if (setpriv === "" || bash === "" || setsid === "" || sleep === "" || head === "") return ""
+  var detach = setpriv + " --pdeathsig KILL " + setsid
+  return "PATH=" + trustedPathEnvironment + "; export PATH; "
+    + "stdout_limit=$1; stderr_limit=$2; deadline=$3; grace=$4; shift 4; child_pid=; timer_pid=; killer_pid=; timed_out=0; "
+    + "stop_timer() { if [ -n \"$timer_pid\" ]; then kill -TERM -- \"-$timer_pid\" 2>/dev/null || true; kill -TERM \"$timer_pid\" 2>/dev/null || true; wait \"$timer_pid\" 2>/dev/null || true; timer_pid=; fi; }; "
+    + "start_group_killer() { " + detach + " " + bash + " -c 'end=$((SECONDS + $1)); while kill -0 -- \"-$2\" 2>/dev/null && [ \"$SECONDS\" -lt \"$end\" ]; do " + sleep + " 0.1; done; kill -KILL -- \"-$2\" 2>/dev/null || true' fmcal-output-killer \"$grace\" \"$child_pid\" & killer_pid=$!; }; "
+    + "wait_group_killer() { if [ -n \"$killer_pid\" ]; then wait \"$killer_pid\" 2>/dev/null || true; killer_pid=; fi; }; "
+    + "cleanup_group() { if [ -n \"$child_pid\" ] && kill -0 -- \"-$child_pid\" 2>/dev/null; then kill -TERM -- \"-$child_pid\" 2>/dev/null || true; start_group_killer; wait_group_killer; fi; }; "
+    + "terminate_child() { if [ -n \"$child_pid\" ]; then kill -TERM -- \"-$child_pid\" 2>/dev/null || true; kill -TERM \"$child_pid\" 2>/dev/null || true; start_group_killer; wait \"$child_pid\" 2>/dev/null || true; wait_group_killer; child_pid=; fi; }; "
+    + "stop_child() { trap - HUP INT TERM USR1; stop_timer; terminate_child; exit 143; }; "
+    + "trap 'timed_out=1' USR1; trap stop_child HUP INT TERM; "
+    + detach + " \"$@\" "
+    + "> >(" + head + " -c \"$((stdout_limit + 1))\") "
+    + "2> >(" + head + " -c \"$((stderr_limit + 1))\" >&2) & child_pid=$!; "
+    + "if [ \"$deadline\" -gt 0 ]; then parent_pid=$BASHPID; "
+    + detach + " " + bash + " -c '" + sleep + " \"$1\" || exit 0; kill -USR1 \"$2\" 2>/dev/null || exit 0; kill -TERM -- \"-$3\" 2>/dev/null || true; kill -TERM \"$3\" 2>/dev/null || true; end=$((SECONDS + $4)); while kill -0 -- \"-$3\" 2>/dev/null && [ \"$SECONDS\" -lt \"$end\" ]; do " + sleep + " 0.1; done; if kill -0 -- \"-$3\" 2>/dev/null; then kill -KILL -- \"-$3\" 2>/dev/null || true; fi' "
+    + "fmcal-output-timeout \"$deadline\" \"$parent_pid\" \"$child_pid\" \"$grace\" & timer_pid=$!; fi; "
+    + "wait \"$child_pid\"; status=$?; "
+    + "if [ \"$timed_out\" -eq 1 ]; then wait \"$child_pid\" 2>/dev/null || true; status=124; wait \"$timer_pid\" 2>/dev/null || true; timer_pid=; "
+    + "else stop_timer; cleanup_group; fi; child_pid=; exit \"$status\""
+}
 
-function boundedCaptureCommand(command, stdoutLimit, stderrLimit, timeoutSeconds, killGraceSeconds) {
+// `command` is an argv vector whose first element must already be an absolute
+// path from the resolved table. An unresolved table yields [] — a Process
+// given an empty command starts nothing, which is the fail-closed outcome.
+function boundedCaptureCommand(tools, command, stdoutLimit, stderrLimit, timeoutSeconds, killGraceSeconds) {
+  if (!toolsResolved(tools)) return []
+  var setpriv = toolPath(tools, "setpriv")
+  var bash = toolPath(tools, "bash")
+  var script = boundedCaptureScript(tools)
   var source = Array.isArray(command) ? command : []
+  if (setpriv === "" || bash === "" || script === "" || source.length === 0) return []
+  if (validAbsoluteExecutable(source[0]) === "") return []
   var stdoutBytes = positiveInteger(stdoutLimit, cliResponseByteLimit)
   var stderrBytes = positiveInteger(stderrLimit, cliErrorByteLimit)
   var deadline = timeoutSeconds === 0 ? 0 : positiveInteger(timeoutSeconds, finiteCommandTimeoutSec)
   var grace = positiveInteger(killGraceSeconds, finiteCommandKillGraceSec)
-  return ["setpriv", "--pdeathsig", "TERM", "bash", "-o", "pipefail", "-c",
-    boundedCaptureScript, "fmcal-output-guard", String(stdoutBytes), String(stderrBytes),
+  return [setpriv, "--pdeathsig", "TERM", bash, "-o", "pipefail", "-c",
+    script, "fmcal-output-guard", String(stdoutBytes), String(stderrBytes),
     String(deadline), String(grace)].concat(source)
 }
 
@@ -720,24 +909,41 @@ function resolveHref(href, origin) {
   return value
 }
 
-function secretLookupCommand() {
-  return boundedCaptureCommand(["secret-tool", "lookup", "service", secretService, "account", secretAccount],
+function secretLookupCommand(tools) {
+  if (!toolsResolved(tools)) return []
+  var secretTool = toolPath(tools, "secret-tool")
+  if (secretTool === "") return []
+  return boundedCaptureCommand(tools, [secretTool, "lookup", "service", secretService, "account", secretAccount],
     4096, cliErrorByteLimit)
 }
 
-function secretClearCommand() {
-  return boundedCaptureCommand(["secret-tool", "clear", "service", secretService, "account", secretAccount],
+function secretClearCommand(tools) {
+  if (!toolsResolved(tools)) return []
+  var secretTool = toolPath(tools, "secret-tool")
+  if (secretTool === "") return []
+  return boundedCaptureCommand(tools, [secretTool, "clear", "service", secretService, "account", secretAccount],
     4096, cliErrorByteLimit)
 }
 
 // The non-secret half of the keyring item. `secret-tool search` prints the
 // item's attributes alongside its secret; only the `attribute.` lines are
 // let through, so the password itself never reaches this process's stdout.
-var accountInfoShell = "secret-tool search service " + shellQuote(secretService) + " account " + shellQuote(secretAccount)
-  + " 2>&1 | grep '^attribute\\.' || true"
+function accountInfoShell(tools) {
+  if (!toolsResolved(tools)) return ""
+  var secretTool = toolPath(tools, "secret-tool")
+  var grep = toolPath(tools, "grep")
+  if (secretTool === "" || grep === "") return ""
+  return "PATH=" + trustedPathEnvironment + "; export PATH; "
+    + secretTool + " search service " + shellQuote(secretService) + " account " + shellQuote(secretAccount)
+    + " 2>&1 | " + grep + " '^attribute\\.' || true"
+}
 
-function accountInfoCommand() {
-  return boundedCaptureCommand(["bash", "-c", accountInfoShell, "fmcal-account"], 4096, cliErrorByteLimit)
+function accountInfoCommand(tools) {
+  if (!toolsResolved(tools)) return []
+  var bash = toolPath(tools, "bash")
+  var shell = accountInfoShell(tools)
+  if (bash === "" || shell === "") return []
+  return boundedCaptureCommand(tools, [bash, "-c", shell, "fmcal-account"], 4096, cliErrorByteLimit)
 }
 
 function parseAccountInfo(raw) {
@@ -752,37 +958,66 @@ function parseAccountInfo(raw) {
   return { server: server, username: username }
 }
 
-// The shell prelude every authenticated request runs: check the two external
-// tools exist, read the username (attribute) and password (secret) out of the
-// keyring, refuse either if it carries a control character, and build curl's
+// The shell prelude every authenticated request runs: pin PATH, confirm the
+// two external tools are still executable where they resolved, read the
+// username (attribute) and password (secret) out of the keyring, refuse
+// either if it carries a control character, and build curl's
 // config-from-stdin `user =` line with backslash and double quote escaped the
-// way curl's config parser expects. Nothing here touches argv or disk.
-var caldavCredentialShell = ""
-  + "command -v secret-tool >/dev/null 2>&1 || { printf '%s' '{\"ok\":false,\"error\":\"secret-tool (libsecret) is required\",\"code\":\"missing_tool\"}' >&2; exit 1; }; "
-  + "command -v curl >/dev/null 2>&1 || { printf '%s' '{\"ok\":false,\"error\":\"curl is required\",\"code\":\"missing_tool\"}' >&2; exit 1; }; "
-  + "info=$(secret-tool search service " + shellQuote(secretService) + " account " + shellQuote(secretAccount) + " 2>&1 | grep '^attribute\\.' || true); "
-  + "username=$(printf '%s\\n' \"$info\" | sed -n 's/^attribute\\.username = //p' | head -n 1); "
-  + "password=$(secret-tool lookup service " + shellQuote(secretService) + " account " + shellQuote(secretAccount) + " 2>/dev/null); "
-  + "if [ -z \"$password\" ] || [ -z \"$username\" ]; then printf '%s' '{\"ok\":false,\"error\":\"No calendar credentials stored\",\"code\":\"no_credentials\"}' >&2; exit 1; fi; "
-  + "case \"$username$password\" in *[[:cntrl:]]*) printf '%s' '{\"ok\":false,\"error\":\"Stored calendar credentials have unexpected characters\",\"code\":\"auth\"}' >&2; exit 1;; esac; "
-  + "esc() { printf '%s' \"$1\" | sed 's/[\\\\\"]/\\\\&/g'; }; "
-  + "cfg=$(printf 'user = \"%s:%s\"\\n' \"$(esc \"$username\")\" \"$(esc \"$password\")\"); "
-  + "unset password; "
+// way curl's config parser expects. Every tool named here is an absolute path
+// from the resolved table. Nothing here touches argv or disk.
+function caldavCredentialShell(tools) {
+  if (!toolsResolved(tools)) return ""
+  var secretTool = toolPath(tools, "secret-tool")
+  var curl = toolPath(tools, "curl")
+  var grep = toolPath(tools, "grep")
+  var sed = toolPath(tools, "sed")
+  var head = toolPath(tools, "head")
+  if (secretTool === "" || curl === "" || grep === "" || sed === "" || head === "") return ""
+  return "PATH=" + trustedPathEnvironment + "; export PATH; "
+    + "[ -x " + secretTool + " ] || { printf '%s' '{\"ok\":false,\"error\":\"secret-tool (libsecret) is required\",\"code\":\"missing_tool\"}' >&2; exit 1; }; "
+    + "[ -x " + curl + " ] || { printf '%s' '{\"ok\":false,\"error\":\"curl is required\",\"code\":\"missing_tool\"}' >&2; exit 1; }; "
+    + "info=$(" + secretTool + " search service " + shellQuote(secretService) + " account " + shellQuote(secretAccount) + " 2>&1 | " + grep + " '^attribute\\.' || true); "
+    + "username=$(printf '%s\\n' \"$info\" | " + sed + " -n 's/^attribute\\.username = //p' | " + head + " -n 1); "
+    + "password=$(" + secretTool + " lookup service " + shellQuote(secretService) + " account " + shellQuote(secretAccount) + " 2>/dev/null); "
+    + "if [ -z \"$password\" ] || [ -z \"$username\" ]; then printf '%s' '{\"ok\":false,\"error\":\"No calendar credentials stored\",\"code\":\"no_credentials\"}' >&2; exit 1; fi; "
+    + "case \"$username$password\" in *[[:cntrl:]]*) printf '%s' '{\"ok\":false,\"error\":\"Stored calendar credentials have unexpected characters\",\"code\":\"auth\"}' >&2; exit 1;; esac; "
+    + "esc() { printf '%s' \"$1\" | " + sed + " 's/[\\\\\"]/\\\\&/g'; }; "
+    + "cfg=$(printf 'user = \"%s:%s\"\\n' \"$(esc \"$username\")\" \"$(esc \"$password\")\"); "
+    + "unset password; "
+}
 
 // The status trailer and per-calendar frame markers carry a boundary that
 // is generated fresh for every invocation (argv, not secret) so a response
-// body cannot forge a frame or a status.
-var curlBase = "curl -sS --max-time 25 --proto =https --max-redirs 0 -K - "
-  + "-w \"\\\\n--fmcal-http-$boundary-- %{http_code} %{redirect_url}\\\\n\""
-var curlCommon = curlBase + " -H 'Content-Type: application/xml; charset=utf-8'"
+// body cannot forge a frame or a status. `-q` keeps curl from reading
+// ~/.curlrc: with the environment already scrubbed, that file would be the
+// last ambient channel into a request carrying the app password.
+function curlBase(tools) {
+  if (!toolsResolved(tools)) return ""
+  var curl = toolPath(tools, "curl")
+  if (curl === "") return ""
+  return curl + " -q -sS --max-time 25 --proto =https --max-redirs 0 -K - "
+    + "-w \"\\\\n--fmcal-http-$boundary-- %{http_code} %{redirect_url}\\\\n\""
+}
+
+function curlCommon(tools) {
+  var base = curlBase(tools)
+  return base === "" ? "" : base + " -H 'Content-Type: application/xml; charset=utf-8'"
+}
+
 var networkFailure = "{ printf '%s' '{\"ok\":false,\"error\":\"Could not reach the calendar server\",\"code\":\"network\"}' >&2; exit 1; }"
 
 // One request: method, Depth header, URL and XML body as positional args
 // (none of them secret), credentials from the prelude. curl handles no
 // redirects itself — the caller sees the 3xx plus its Location and decides,
 // so the credentials are never replayed to a host this code did not vet.
-var caldavRequestShell = "method=$1; depth=$2; url=$3; body=$4; boundary=$5; " + caldavCredentialShell
-  + "printf '%s\\n' \"$cfg\" | " + curlCommon + " -X \"$method\" -H \"Depth: $depth\" --data-binary \"$body\" \"$url\" || " + networkFailure
+function caldavRequestShell(tools) {
+  if (!toolsResolved(tools)) return ""
+  var credentials = caldavCredentialShell(tools)
+  var curl = curlCommon(tools)
+  if (credentials === "" || curl === "") return ""
+  return "method=$1; depth=$2; url=$3; body=$4; boundary=$5; " + credentials
+    + "printf '%s\\n' \"$cfg\" | " + curl + " -X \"$method\" -H \"Depth: $depth\" --data-binary \"$body\" \"$url\" || " + networkFailure
+}
 
 function newBoundary() {
   var out = ""
@@ -794,27 +1029,41 @@ function validBoundary(value) {
   return /^[0-9a-f]{16}$/.test(String(value || "")) ? String(value) : ""
 }
 
-function caldavRequestCommand(method, depth, url, body, boundary, stdoutLimit) {
-  return boundedCaptureCommand(
-    ["bash", "-c", caldavRequestShell, "fmcal-caldav", String(method || "PROPFIND"), String(depth || "0"), String(url || ""), String(body || ""), validBoundary(boundary)],
+function caldavRequestCommand(tools, method, depth, url, body, boundary, stdoutLimit) {
+  if (!toolsResolved(tools)) return []
+  var bash = toolPath(tools, "bash")
+  var shell = caldavRequestShell(tools)
+  if (bash === "" || shell === "") return []
+  return boundedCaptureCommand(tools,
+    [bash, "-c", shell, "fmcal-caldav", String(method || "PROPFIND"), String(depth || "0"), String(url || ""), String(body || ""), validBoundary(boundary)],
     stdoutLimit || cliResponseByteLimit, cliErrorByteLimit)
 }
 
 // The window fetch: one calendar-query REPORT per calendar href, all in one
 // process so the keyring is read once, each response framed by a begin line
 // carrying its href and the same status trailer as a single request.
-var caldavWindowShell = "origin=$1; body=$2; boundary=$3; shift 3; " + caldavCredentialShell
-  + "for href in \"$@\"; do printf '\\n--fmcal-begin-%s-- %s\\n' \"$boundary\" \"$href\"; "
-  + "printf '%s\\n' \"$cfg\" | " + curlCommon + " -X REPORT -H 'Depth: 1' --data-binary \"$body\" \"$origin$href\" || " + networkFailure + "; "
-  + "done"
+function caldavWindowShell(tools) {
+  if (!toolsResolved(tools)) return ""
+  var credentials = caldavCredentialShell(tools)
+  var curl = curlCommon(tools)
+  if (credentials === "" || curl === "") return ""
+  return "origin=$1; body=$2; boundary=$3; shift 3; " + credentials
+    + "for href in \"$@\"; do printf '\\n--fmcal-begin-%s-- %s\\n' \"$boundary\" \"$href\"; "
+    + "printf '%s\\n' \"$cfg\" | " + curl + " -X REPORT -H 'Depth: 1' --data-binary \"$body\" \"$origin$href\" || " + networkFailure + "; "
+    + "done"
+}
 
 var windowResponseByteLimit = 8 * 1024 * 1024
 
-function caldavWindowCommand(origin, hrefs, startUtcMs, endUtcMs, boundary) {
-  var args = ["bash", "-c", caldavWindowShell, "fmcal-caldav-window", String(origin || ""), calendarQueryBody(startUtcMs, endUtcMs), validBoundary(boundary)]
+function caldavWindowCommand(tools, origin, hrefs, startUtcMs, endUtcMs, boundary) {
+  if (!toolsResolved(tools)) return []
+  var bash = toolPath(tools, "bash")
+  var shell = caldavWindowShell(tools)
+  if (bash === "" || shell === "") return []
+  var args = [bash, "-c", shell, "fmcal-caldav-window", String(origin || ""), calendarQueryBody(startUtcMs, endUtcMs), validBoundary(boundary)]
   var list = Array.isArray(hrefs) ? hrefs : []
   for (var i = 0; i < list.length && i < 128; i++) args.push(String(list[i]))
-  return boundedCaptureCommand(args, windowResponseByteLimit, cliErrorByteLimit, 90)
+  return boundedCaptureCommand(tools, args, windowResponseByteLimit, cliErrorByteLimit, 90)
 }
 
 // Splits curl's output into body + status trailer. A missing trailer means
@@ -866,11 +1115,21 @@ function parseWindowResponses(raw, boundary) {
 // the calendar collection (RFC 4791 §5.3.2). `If-None-Match: *` makes the
 // server refuse to overwrite anything already there, so a UID collision
 // can never clobber an existing event.
-var caldavPutShell = "url=$1; body=$2; boundary=$3; " + caldavCredentialShell
-  + "printf '%s\\n' \"$cfg\" | " + curlBase + " -X PUT -H 'Content-Type: text/calendar; charset=utf-8' -H 'If-None-Match: *' --data-binary \"$body\" \"$url\" || " + networkFailure
+function caldavPutShell(tools) {
+  if (!toolsResolved(tools)) return ""
+  var credentials = caldavCredentialShell(tools)
+  var curl = curlBase(tools)
+  if (credentials === "" || curl === "") return ""
+  return "url=$1; body=$2; boundary=$3; " + credentials
+    + "printf '%s\\n' \"$cfg\" | " + curl + " -X PUT -H 'Content-Type: text/calendar; charset=utf-8' -H 'If-None-Match: *' --data-binary \"$body\" \"$url\" || " + networkFailure
+}
 
-function caldavPutCommand(url, body, boundary) {
-  return boundedCaptureCommand(["bash", "-c", caldavPutShell, "fmcal-caldav-put", String(url || ""), String(body || ""), validBoundary(boundary)],
+function caldavPutCommand(tools, url, body, boundary) {
+  if (!toolsResolved(tools)) return []
+  var bash = toolPath(tools, "bash")
+  var shell = caldavPutShell(tools)
+  if (bash === "" || shell === "") return []
+  return boundedCaptureCommand(tools, [bash, "-c", shell, "fmcal-caldav-put", String(url || ""), String(body || ""), validBoundary(boundary)],
     cliResponseByteLimit, cliErrorByteLimit)
 }
 
@@ -1653,23 +1912,37 @@ var setupLockDirectoryName = "setup-lock"
 // launcher runs the command through a transient unit runner that expands ${NAME}
 // as environment variables (systemd >= 254, --expand-environment=yes by
 // default) before bash ever sees the text — ${server:-x} became "".
-var setupLockShell = "uid=$(id -u) || exit 76; "
-  + "runtime=$XDG_RUNTIME_DIR; [ -n \"$runtime\" ] || runtime=/run/user/$uid; "
-  + "[ -d \"$runtime\" ] && [ ! -L \"$runtime\" ] "
-  + "&& [ \"$(stat -c %u -- \"$runtime\" 2>/dev/null)\" = \"$uid\" ] "
-  + "&& [ \"$(stat -c %a -- \"$runtime\" 2>/dev/null)\" = 700 ] || exit 76; "
-  + "ensure_private_dir() { path=$1; "
-  + "if mkdir -m 700 -- \"$path\" 2>/dev/null; then return 0; fi; "
-  + "[ -d \"$path\" ] && [ ! -L \"$path\" ] "
-  + "&& [ \"$(stat -c %u -- \"$path\" 2>/dev/null)\" = \"$uid\" ] "
-  + "&& chmod 700 -- \"$path\"; }; "
-  + "umask 077; base=\"$runtime/" + secretService + "-$uid\"; "
-  + "ensure_private_dir \"$base\" || exit 76; "
-  + "lock=\"$base/" + setupLockDirectoryName + "\"; "
-  + "ensure_private_dir \"$lock\" || exit 76; "
+function setupLockShell(tools) {
+  if (!toolsResolved(tools)) return ""
+  var id = toolPath(tools, "id")
+  var stat = toolPath(tools, "stat")
+  var mkdir = toolPath(tools, "mkdir")
+  var chmod = toolPath(tools, "chmod")
+  if (id === "" || stat === "" || mkdir === "" || chmod === "") return ""
+  return "PATH=" + trustedPathEnvironment + "; export PATH; "
+    + "uid=$(" + id + " -u) || exit 76; "
+    + "runtime=$XDG_RUNTIME_DIR; [ -n \"$runtime\" ] || runtime=/run/user/$uid; "
+    + "[ -d \"$runtime\" ] && [ ! -L \"$runtime\" ] "
+    + "&& [ \"$(" + stat + " -c %u -- \"$runtime\" 2>/dev/null)\" = \"$uid\" ] "
+    + "&& [ \"$(" + stat + " -c %a -- \"$runtime\" 2>/dev/null)\" = 700 ] || exit 76; "
+    + "ensure_private_dir() { path=$1; "
+    + "if " + mkdir + " -m 700 -- \"$path\" 2>/dev/null; then return 0; fi; "
+    + "[ -d \"$path\" ] && [ ! -L \"$path\" ] "
+    + "&& [ \"$(" + stat + " -c %u -- \"$path\" 2>/dev/null)\" = \"$uid\" ] "
+    + "&& " + chmod + " 700 -- \"$path\"; }; "
+    + "umask 077; base=\"$runtime/" + secretService + "-$uid\"; "
+    + "ensure_private_dir \"$base\" || exit 76; "
+    + "lock=\"$base/" + setupLockDirectoryName + "\"; "
+    + "ensure_private_dir \"$lock\" || exit 76; "
+}
 
-function setupLockCheckCommand() {
-  return ["bash", "-c", setupLockShell + "exec 9<\"$lock\"; flock -n 9"]
+function setupLockCheckCommand(tools) {
+  if (!toolsResolved(tools)) return []
+  var bash = toolPath(tools, "bash")
+  var flock = toolPath(tools, "flock")
+  var lock = setupLockShell(tools)
+  if (bash === "" || flock === "" || lock === "") return []
+  return [bash, "-c", lock + "exec 9<\"$lock\"; " + flock + " -n 9", "fmcal-setup-lock"]
 }
 
 // The credential-capture script: instructions, three prompts (the password
@@ -1678,68 +1951,104 @@ function setupLockCheckCommand() {
 // anything is persisted, then `secret-tool clear` + `store` fed the
 // password over stdin. The server URL and username are attributes, i.e.
 // secret-tool arguments — they are not secrets.
-var setupCredentialsScript = "set -eu; clear 2>/dev/null || true; "
-  + "printf '%s\\n' 'Calendar setup (CalDAV)' '' "
-  + "'Works with Fastmail and any other CalDAV server.' '' "
-  + "'Fastmail: Settings > Privacy & Security > Integrations > App passwords,' "
-  + "'  New app password, with access limited to Calendars (CalDAV).' "
-  + "'  " + fastmailAppPasswordHelpUrl + "' '' "
-  + "'The password goes straight to your system keyring — never into this repo,' "
-  + "'a log file, or your shell history.' ''; "
-  // Terminal query replies (gum's, the emulator's) can be queued on the tty
-  // ahead of anything the user types and would be read as the first answer;
-  // drain them the way omarchy-show-done does, then also strip any CSI/OSC
-  // residue and control characters from what is read.
-  + "while IFS= read -rsn 1 -t 0.2 _; do :; done; "
-  + "strip_term() { sed -E 's/\\x1b\\][^\\x07\\x1b]*(\\x07|\\x1b\\\\)//g; s/\\x1b\\[[0-9;?]*[ -\\/]*[@-~]//g' | tr -d '[:cntrl:]'; }; "
-  + "printf '%s' 'Server URL [" + defaultServerUrl + "]: '; IFS= read -r server; "
-  + "server=$(printf '%s' \"$server\" | strip_term | tr -d '[:space:]' | sed 's,/*$,,'); [ -n \"$server\" ] || server=" + defaultServerUrl + "; "
-  + "case \"$server\" in https://*) : ;; *) printf '%s\\n' 'The server URL must start with https://'; exit 1;; esac; "
-  // Same character class as validServerUrl, so what setup accepts the
-  // service will read back.
-  + "case \"$server\" in *[!A-Za-z0-9._~:/@%+,\\;=!\\&-]*) printf '%s\\n' 'That server URL has unexpected characters.'; exit 1;; esac; "
-  + "shost=$(printf '%s' \"$server\" | sed -E 's,^https://([^/:]+).*,\\1,' | tr 'A-Z' 'a-z'); "
-  + "sbase=$(printf '%s' \"$shost\" | awk -F. 'NF>=2{print $(NF-1)\".\"$NF}'); "
-  + "printf '%s' 'Username (usually your email address): '; IFS= read -r username; "
-  + "username=$(printf '%s' \"$username\" | strip_term | tr -d '[:space:]'); "
-  + "if [ -z \"$username\" ]; then printf '%s\\n' 'No username entered.'; exit 1; fi; "
-  + "printf '%s' 'App password: '; "
-  + "stty -echo 2>/dev/null || true; IFS= read -r password; stty echo 2>/dev/null || true; printf '\\n'; "
-  + "if [ -z \"$password\" ]; then printf '%s\\n' 'No password entered.'; exit 1; fi; "
-  + "case \"$username$password\" in *[[:cntrl:]]*) printf '%s\\n' 'That has unexpected control characters.'; exit 1;; esac; "
-  + "esc() { printf '%s' \"$1\" | sed 's/[\\\\\"]/\\\\&/g'; }; "
-  + "cfg=$(printf 'user = \"%s:%s\"\\n' \"$(esc \"$username\")\" \"$(esc \"$password\")\"); "
-  + "probe() { url=$1; n=0; while :; do "
-  + "out=$(printf '%s\\n' \"$cfg\" | curl -sS --max-time 20 --proto =https --max-redirs 0 -K - -o /dev/null -w '%{http_code} %{redirect_url}' -X PROPFIND -H 'Depth: 0' \"$url\") || { printf '%s\\n' \"Could not reach $url\"; exit 1; }; "
-  + "code=$(printf '%s' \"$out\" | cut -d ' ' -f 1); redirect=$(printf '%s' \"$out\" | cut -d ' ' -f 2-); "
-  + "case \"$code\" in 301|302|303|307|308) "
-  + "case \"$redirect\" in https://*) : ;; *) printf '%s\\n' 'The server redirected somewhere that is not https.'; exit 1;; esac; "
-  // Redirects stay inside the configured server's own domain (the
-  // credentials go along), the same rule the service applies.
-  + "rhost=$(printf '%s' \"$redirect\" | sed -E 's,^https://([^/:]+).*,\\1,' | tr 'A-Z' 'a-z'); "
-  + "if [ \"$rhost\" != \"$shost\" ]; then case \"$rhost\" in *\".$sbase\") : ;; *) printf '%s\\n' \"The server redirected to $rhost, outside its own domain.\"; exit 1;; esac; fi; "
-  + "n=$((n + 1)); if [ \"$n\" -gt " + maxDiscoveryRedirects + " ]; then printf '%s\\n' 'Too many redirects.'; exit 1; fi; url=$redirect; continue;; esac; break; done; }; "
-  + "printf '%s\\n' 'Checking the server…'; "
-  + "case \"$server\" in https://*/*) probe \"$server\";; *) probe \"$server/.well-known/caldav\"; case \"$code\" in 404|405) probe \"$server/\";; esac;; esac; "
-  + "case \"$code\" in 2??) : ;; 401|403) printf '%s\\n' 'The server rejected that username and password.'; exit 1;; "
-  + "*) printf '%s\\n' \"The server answered HTTP $code — check the server URL.\"; exit 1;; esac; "
-  // A server that answers that address without a login could not have
-  // checked the password; say so rather than pretend it did.
-  + "anon=$(curl -sS --max-time 20 --proto =https --max-redirs 0 -o /dev/null -w '%{http_code}' -X PROPFIND -H 'Depth: 0' \"$url\" 2>/dev/null || printf '000'); "
-  + "case \"$anon\" in 2??) printf '%s\\n' 'Note: the server did not ask for a password there, so these credentials could not be checked. Saving anyway.';; esac; "
-  + "secret-tool clear service " + shellQuote(secretService) + " account " + shellQuote(secretAccount) + " 2>/dev/null || true; "
-  + "printf '%s' \"$password\" | secret-tool store --label='Fastmail Calendar (CalDAV) app password' service " + shellQuote(secretService) + " account " + shellQuote(secretAccount) + " server \"$server\" username \"$username\"; "
-  + "unset password cfg; "
-  + "printf '%s\\n' '' 'Saved. You can close this window.'"
+//
+// This one runs inside a floating terminal, whose launcher cannot be handed a
+// scrubbed environment without breaking the terminal itself, so pinning PATH
+// and naming every tool by its absolute path matters more here than anywhere
+// else: it is the only path the app password is typed on.
+function setupCredentialsScript(tools) {
+  if (!toolsResolved(tools)) return ""
+  var secretTool = toolPath(tools, "secret-tool")
+  var curl = toolPath(tools, "curl")
+  var sed = toolPath(tools, "sed")
+  var tr = toolPath(tools, "tr")
+  var cut = toolPath(tools, "cut")
+  var awk = toolPath(tools, "awk")
+  var stty = toolPath(tools, "stty")
+  if (secretTool === "" || curl === "" || sed === "" || tr === "" || cut === "" || awk === "" || stty === "") return ""
+  // Cosmetic, and already tolerant of failure — skipped entirely rather than
+  // resolved through PATH when it is not in a trusted directory.
+  var clear = toolPath(tools, "clear")
+  return "set -eu; PATH=" + trustedSessionPathEnvironment + "; export PATH; "
+    + (clear === "" ? "" : clear + " 2>/dev/null || true; ")
+    + "printf '%s\\n' 'Calendar setup (CalDAV)' '' "
+    + "'Works with Fastmail and any other CalDAV server.' '' "
+    + "'Fastmail: Settings > Privacy & Security > Integrations > App passwords,' "
+    + "'  New app password, with access limited to Calendars (CalDAV).' "
+    + "'  " + fastmailAppPasswordHelpUrl + "' '' "
+    + "'The password goes straight to your system keyring — never into this repo,' "
+    + "'a log file, or your shell history.' ''; "
+    // Terminal query replies (gum's, the emulator's) can be queued on the tty
+    // ahead of anything the user types and would be read as the first answer;
+    // drain them the way omarchy-show-done does, then also strip any CSI/OSC
+    // residue and control characters from what is read.
+    + "while IFS= read -rsn 1 -t 0.2 _; do :; done; "
+    + "strip_term() { " + sed + " -E 's/\\x1b\\][^\\x07\\x1b]*(\\x07|\\x1b\\\\)//g; s/\\x1b\\[[0-9;?]*[ -\\/]*[@-~]//g' | " + tr + " -d '[:cntrl:]'; }; "
+    + "printf '%s' 'Server URL [" + defaultServerUrl + "]: '; IFS= read -r server; "
+    + "server=$(printf '%s' \"$server\" | strip_term | " + tr + " -d '[:space:]' | " + sed + " 's,/*$,,'); [ -n \"$server\" ] || server=" + defaultServerUrl + "; "
+    + "case \"$server\" in https://*) : ;; *) printf '%s\\n' 'The server URL must start with https://'; exit 1;; esac; "
+    // Same character class as validServerUrl, so what setup accepts the
+    // service will read back.
+    + "case \"$server\" in *[!A-Za-z0-9._~:/@%+,\\;=!\\&-]*) printf '%s\\n' 'That server URL has unexpected characters.'; exit 1;; esac; "
+    + "shost=$(printf '%s' \"$server\" | " + sed + " -E 's,^https://([^/:]+).*,\\1,' | " + tr + " 'A-Z' 'a-z'); "
+    + "sbase=$(printf '%s' \"$shost\" | " + awk + " -F. 'NF>=2{print $(NF-1)\".\"$NF}'); "
+    + "printf '%s' 'Username (usually your email address): '; IFS= read -r username; "
+    + "username=$(printf '%s' \"$username\" | strip_term | " + tr + " -d '[:space:]'); "
+    + "if [ -z \"$username\" ]; then printf '%s\\n' 'No username entered.'; exit 1; fi; "
+    + "printf '%s' 'App password: '; "
+    + stty + " -echo 2>/dev/null || true; IFS= read -r password; " + stty + " echo 2>/dev/null || true; printf '\\n'; "
+    + "if [ -z \"$password\" ]; then printf '%s\\n' 'No password entered.'; exit 1; fi; "
+    + "case \"$username$password\" in *[[:cntrl:]]*) printf '%s\\n' 'That has unexpected control characters.'; exit 1;; esac; "
+    + "esc() { printf '%s' \"$1\" | " + sed + " 's/[\\\\\"]/\\\\&/g'; }; "
+    + "cfg=$(printf 'user = \"%s:%s\"\\n' \"$(esc \"$username\")\" \"$(esc \"$password\")\"); "
+    + "probe() { url=$1; n=0; while :; do "
+    + "out=$(printf '%s\\n' \"$cfg\" | " + curl + " -q -sS --max-time 20 --proto =https --max-redirs 0 -K - -o /dev/null -w '%{http_code} %{redirect_url}' -X PROPFIND -H 'Depth: 0' \"$url\") || { printf '%s\\n' \"Could not reach $url\"; exit 1; }; "
+    + "code=$(printf '%s' \"$out\" | " + cut + " -d ' ' -f 1); redirect=$(printf '%s' \"$out\" | " + cut + " -d ' ' -f 2-); "
+    + "case \"$code\" in 301|302|303|307|308) "
+    + "case \"$redirect\" in https://*) : ;; *) printf '%s\\n' 'The server redirected somewhere that is not https.'; exit 1;; esac; "
+    // Redirects stay inside the configured server's own domain (the
+    // credentials go along), the same rule the service applies.
+    + "rhost=$(printf '%s' \"$redirect\" | " + sed + " -E 's,^https://([^/:]+).*,\\1,' | " + tr + " 'A-Z' 'a-z'); "
+    + "if [ \"$rhost\" != \"$shost\" ]; then case \"$rhost\" in *\".$sbase\") : ;; *) printf '%s\\n' \"The server redirected to $rhost, outside its own domain.\"; exit 1;; esac; fi; "
+    + "n=$((n + 1)); if [ \"$n\" -gt " + maxDiscoveryRedirects + " ]; then printf '%s\\n' 'Too many redirects.'; exit 1; fi; url=$redirect; continue;; esac; break; done; }; "
+    + "printf '%s\\n' 'Checking the server…'; "
+    + "case \"$server\" in https://*/*) probe \"$server\";; *) probe \"$server/.well-known/caldav\"; case \"$code\" in 404|405) probe \"$server/\";; esac;; esac; "
+    + "case \"$code\" in 2??) : ;; 401|403) printf '%s\\n' 'The server rejected that username and password.'; exit 1;; "
+    + "*) printf '%s\\n' \"The server answered HTTP $code — check the server URL.\"; exit 1;; esac; "
+    // A server that answers that address without a login could not have
+    // checked the password; say so rather than pretend it did.
+    + "anon=$(" + curl + " -q -sS --max-time 20 --proto =https --max-redirs 0 -o /dev/null -w '%{http_code}' -X PROPFIND -H 'Depth: 0' \"$url\" 2>/dev/null || printf '000'); "
+    + "case \"$anon\" in 2??) printf '%s\\n' 'Note: the server did not ask for a password there, so these credentials could not be checked. Saving anyway.';; esac; "
+    + secretTool + " clear service " + shellQuote(secretService) + " account " + shellQuote(secretAccount) + " 2>/dev/null || true; "
+    + "printf '%s' \"$password\" | " + secretTool + " store --label='Fastmail Calendar (CalDAV) app password' service " + shellQuote(secretService) + " account " + shellQuote(secretAccount) + " server \"$server\" username \"$username\"; "
+    + "unset password cfg; "
+    + "printf '%s\\n' '' 'Saved. You can close this window.'"
+}
 
-function setupLaunchCommand(ipcTarget) {
+// The script handed to the floating-terminal launcher, and the launcher's own
+// argv. The launcher takes the script as one argument (Panel.qml passes the
+// vector straight to Quickshell.execDetached, so nothing re-tokenizes it).
+function setupLaunchScript(tools, ipcTarget) {
+  if (!toolsResolved(tools)) return ""
+  var omarchyShell = toolPath(tools, "omarchy-shell")
+  var flock = toolPath(tools, "flock")
+  var lock = setupLockShell(tools)
+  var credentials = setupCredentialsScript(tools)
+  if (omarchyShell === "" || flock === "" || lock === "" || credentials === "") return ""
   var target = shellQuote(ipcTarget)
-  var completion = "omarchy-shell -q \"$target\" setupFinished"
-  return "target=" + target + "; " + setupLockShell
-    + "( flock -n 9 || { printf '%s\\n' 'Calendar setup is already running.'; exit 75; }; "
+  var completion = omarchyShell + " -q \"$target\" setupFinished"
+  return "target=" + target + "; " + lock
+    + "( " + flock + " -n 9 || { printf '%s\\n' 'Calendar setup is already running.'; exit 75; }; "
     + "trap 'exit 129' HUP; trap 'exit 130' INT; trap 'exit 143' TERM; "
-    + "trap 'rc=$?; trap - EXIT; flock -u 9; " + completion + "; exit $rc' EXIT; "
-    + setupCredentialsScript + " ) 9<\"$lock\""
+    + "trap 'rc=$?; trap - EXIT; " + flock + " -u 9; " + completion + "; exit $rc' EXIT; "
+    + credentials + " ) 9<\"$lock\""
+}
+
+function setupLaunchCommand(tools, ipcTarget) {
+  if (!toolsResolved(tools)) return []
+  var launcher = toolPath(tools, "omarchy-launch-floating-terminal-with-presentation")
+  var script = setupLaunchScript(tools, ipcTarget)
+  return launcher === "" || script === "" ? [] : [launcher, script]
 }
 
 function setupPlan(hasCredentials, authenticated) {
@@ -1965,6 +2274,17 @@ if (typeof module !== "undefined") {
     boundedString: boundedString, cleanText: cleanText, exceedsUtf8ByteLimit: exceedsUtf8ByteLimit,
     remoteTitleCharacterLimit: remoteTitleCharacterLimit, remoteExcerptCharacterLimit: remoteExcerptCharacterLimit,
     remoteNameCharacterLimit: remoteNameCharacterLimit, remoteIdCharacterLimit: remoteIdCharacterLimit,
+    trustedBinaryDirectories: trustedBinaryDirectories, trustedOmarchyDirectories: trustedOmarchyDirectories,
+    trustedPathEnvironment: trustedPathEnvironment, trustedSessionPathEnvironment: trustedSessionPathEnvironment,
+    inheritedEnvironmentNames: inheritedEnvironmentNames,
+    minimalEnvironment: minimalEnvironment, probeEnvironment: probeEnvironment,
+    bashCandidates: bashCandidates, requiredExecutables: requiredExecutables,
+    optionalExecutables: optionalExecutables, requiredOmarchyCommands: requiredOmarchyCommands,
+    validAbsoluteExecutable: validAbsoluteExecutable, toolPath: toolPath,
+    toolsResolved: toolsResolved, missingTools: missingTools,
+    toolResolutionScript: toolResolutionScript, toolResolutionCommand: toolResolutionCommand,
+    parseToolTable: parseToolTable,
+    boundedCaptureScript: boundedCaptureScript,
     boundedCaptureCommand: boundedCaptureCommand, shellQuote: shellQuote,
     cliResponseByteLimit: cliResponseByteLimit, cliErrorByteLimit: cliErrorByteLimit,
     parseJson: parseJson, parseFailure: parseFailure, isAuthError: isAuthError,
@@ -1977,7 +2297,8 @@ if (typeof module !== "undefined") {
     discoveryStartUrl: discoveryStartUrl, resolveHref: resolveHref,
     secretLookupCommand: secretLookupCommand, secretClearCommand: secretClearCommand,
     accountInfoShell: accountInfoShell, accountInfoCommand: accountInfoCommand, parseAccountInfo: parseAccountInfo,
-    caldavCredentialShell: caldavCredentialShell, caldavRequestShell: caldavRequestShell, caldavRequestCommand: caldavRequestCommand,
+    caldavCredentialShell: caldavCredentialShell, curlBase: curlBase, curlCommon: curlCommon,
+    caldavRequestShell: caldavRequestShell, caldavRequestCommand: caldavRequestCommand,
     caldavWindowShell: caldavWindowShell, caldavWindowCommand: caldavWindowCommand, windowResponseByteLimit: windowResponseByteLimit,
     parseHttpResponse: parseHttpResponse, isRedirectStatus: isRedirectStatus, httpFailure: httpFailure, parseWindowResponses: parseWindowResponses,
     decodeXmlEntities: decodeXmlEntities, parseXml: parseXml, xmlChildren: xmlChildren, xmlFind: xmlFind, xmlText: xmlText,
@@ -1993,7 +2314,8 @@ if (typeof module !== "undefined") {
     normalizeTimeOfDay: normalizeTimeOfDay, icsEscapeText: icsEscapeText, icsFoldLine: icsFoldLine,
     generateUid: generateUid, prepareNewEvent: prepareNewEvent,
     eventTitleInputLimit: eventTitleInputLimit, eventLocationInputLimit: eventLocationInputLimit,
-    setupLockCheckCommand: setupLockCheckCommand, setupLaunchCommand: setupLaunchCommand,
+    setupLockShell: setupLockShell, setupLockCheckCommand: setupLockCheckCommand,
+    setupLaunchScript: setupLaunchScript, setupLaunchCommand: setupLaunchCommand,
     setupCredentialsScript: setupCredentialsScript, setupPlan: setupPlan,
     eventStartKey: eventStartKey, eventsByDay: eventsByDay, eventsOnDay: eventsOnDay,
     eventTimeLabel: eventTimeLabel, eventTimeRangeLabel: eventTimeRangeLabel, nextEventLabel: nextEventLabel,

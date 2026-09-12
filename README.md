@@ -125,6 +125,31 @@ This plugin never runs a mail or calendar CLI: it talks CalDAV over HTTPS
 through `curl` — as a bounded child process, output-size- and time-capped,
 the same as every other Ninepoint Labs Omarchy plugin.
 
+- **Every executable is bound to a trusted absolute path, never resolved
+  through your `PATH`.** At startup the plugin builds a tool table by looking
+  for each program it needs in a fixed list of system directories —
+  `/usr/bin`, `/bin`, `/usr/sbin`, `/sbin`, `/run/current-system/sw/bin`
+  (plus `/usr/share/omarchy/bin` for Omarchy's own commands). The lookup runs
+  in a script that uses shell builtins only, so it cannot itself be steered.
+  `/usr/local/bin` and anything under `$HOME` are deliberately excluded. If a
+  required tool is not found in one of those directories the plugin **fails
+  closed**: every command it would build comes back empty, nothing runs, and
+  the panel says which tool is missing. This covers the whole surface —
+  `setpriv`, `setsid`, `bash`, `head` and `sleep` inside the bounded-capture
+  guard, and `secret-tool`, `curl`, `grep`, `sed`, `tr`, `cut`, `awk`,
+  `stty`, `id`, `stat`, `mkdir`, `chmod` and `flock` on the credential and
+  setup paths. A shadow binary earlier in your `PATH` therefore cannot see
+  the app password, redirect a CalDAV request, or defeat the output and
+  deadline controls. (`kill`, `wait`, `trap`, `printf` and `read` are bash
+  builtins: builtins take precedence over `PATH` and cannot be shadowed.)
+- **Subprocesses get a minimal, closed environment, not your session's.**
+  `PATH` is replaced with the trusted directories, the locale is pinned to
+  `C`, and the only variables carried over are `XDG_RUNTIME_DIR`,
+  `DBUS_SESSION_BUS_ADDRESS`, `HOME` and `USER` — what libsecret needs to
+  reach the keyring daemon — each rejected unless it is a plain single-line
+  value. `LD_PRELOAD`, `LD_LIBRARY_PATH`, `http_proxy`, `CURL_HOME`,
+  `BASH_ENV` and everything else are dropped. `curl` additionally runs with
+  `-q`, so it does not read `~/.curlrc`.
 - The password is never a command-line argument, never written to a file,
   and never logged. It travels `secret-tool lookup` → a shell variable → a
   `curl -K -` (config supplied on stdin) `user =` line, inside one
@@ -148,7 +173,11 @@ the same as every other Ninepoint Labs Omarchy plugin.
 - The setup terminal's `read` for the password is echo-off and the password
   is never assembled into a command line, so it never reaches shell
   history. The server URL and username are passed to `secret-tool store` as
-  arguments (they are attributes, not secrets).
+  arguments (they are attributes, not secrets). The setup and lock scripts
+  get the same treatment as the rest: every tool in them is an absolute path
+  from the tool table, `PATH` is pinned inside the script, and the launcher
+  is started as an argument vector — the script is one literal argument that
+  nothing re-tokenizes — rather than being interpolated into a shell string.
 - Every value the server returns — titles, descriptions, locations,
   calendar names, XML, iCalendar — is treated as untrusted plaintext:
   bounded in size, control/bidi/zero-width characters stripped, and always
@@ -168,16 +197,26 @@ the same as every other Ninepoint Labs Omarchy plugin.
 
 For reviewers, this is everything the plugin executes:
 
+Each of these runs through the bounded-capture guard
+(`/usr/bin/setpriv --pdeathsig TERM /usr/bin/bash -o pipefail -c …`), with
+`/usr/bin` standing in below for whichever trusted directory the tool
+actually resolved in:
+
 ```text
-secret-tool search  service ninepointlabs.fastmail-calendar account caldav   (attributes only: server, username)
-secret-tool lookup  service ninepointlabs.fastmail-calendar account caldav   (the password, inside the request script)
-curl -K - -X PROPFIND -H 'Depth: 0' <start url | principal>                 (discovery)
-curl -K - -X PROPFIND -H 'Depth: 1' <calendar home>                         (calendar list)
-curl -K - -X REPORT   -H 'Depth: 1' <each calendar>                         (calendar-query for the visible window)
-curl -K - -X PUT -H 'If-None-Match: *' <calendar>/<new uid>.ics             (Add event — the plugin's only write)
-secret-tool clear  service ninepointlabs.fastmail-calendar account caldav   (setup, and Forget calendar credentials)
-secret-tool store  service ninepointlabs.fastmail-calendar account caldav server <url> username <name>   (setup, in a floating terminal)
-omarchy-launch-floating-terminal-with-presentation '<setup script, quoted>'
+/usr/bin/secret-tool search  service ninepointlabs.fastmail-calendar account caldav   (attributes only: server, username)
+/usr/bin/secret-tool lookup  service ninepointlabs.fastmail-calendar account caldav   (the password, inside the request script)
+/usr/bin/curl -q -K - -X PROPFIND -H 'Depth: 0' <start url | principal>               (discovery)
+/usr/bin/curl -q -K - -X PROPFIND -H 'Depth: 1' <calendar home>                       (calendar list)
+/usr/bin/curl -q -K - -X REPORT   -H 'Depth: 1' <each calendar>                       (calendar-query for the visible window)
+/usr/bin/curl -q -K - -X PUT -H 'If-None-Match: *' <calendar>/<new uid>.ics           (Add event — the plugin's only write)
+/usr/bin/secret-tool clear  service ninepointlabs.fastmail-calendar account caldav    (setup, and Forget calendar credentials)
+/usr/bin/secret-tool store  service ninepointlabs.fastmail-calendar account caldav server <url> username <name>   (setup, in a floating terminal)
+```
+
+plus, as a two-element argument vector rather than a shell string:
+
+```text
+/usr/share/omarchy/bin/omarchy-launch-floating-terminal-with-presentation  <setup script>
 ```
 
 ## Tested servers

@@ -174,11 +174,35 @@ Panel {
     updateWindow()
   }
 
+  // The setup terminal is started as an argument vector, not a shell string:
+  // setupLauncher.command is handed straight to exec, so the script stays one
+  // literal argument that nothing re-tokenizes. Both the launcher and every
+  // tool the script runs are absolute paths out of the service's trusted
+  // table (see Model.js's "Trusted executable resolution"). An unresolved
+  // table yields an empty command and setup simply does not start.
   function launchSetup() {
-    if (!bar || !service || !hostWidget) return
+    if (!service || !hostWidget) return
+    var command = Model.setupLaunchCommand(service.tools, hostWidget.moduleName)
+    if (command.length === 0) return
     if (!service.tryStartSetup()) return
-    bar.run("omarchy-launch-floating-terminal-with-presentation " + Util.shellQuote(Model.setupLaunchCommand(hostWidget.moduleName)))
+    setupLauncher.command = command
+    setupLauncher.startDetached()
     close()
+  }
+
+  // The launcher has to reach the graphical session — Wayland, the session
+  // bus, the terminal's own theme state — so its environment is inherited
+  // rather than cleared; PATH is pinned to the trusted directories so the
+  // launcher's own helpers (uwsm-app, xdg-terminal-exec, omarchy-show-logo)
+  // cannot be shadowed either. Detached so the credential prompt outlives the
+  // panel closing behind it.
+  readonly property var setupLaunchEnvironment: ({ "PATH": Model.trustedSessionPathEnvironment })
+
+  Process {
+    id: setupLauncher
+    running: false
+    command: []
+    environment: root.setupLaunchEnvironment
   }
 
   // ---- Calendar prefs: visibility, color, and a custom display name, each
@@ -499,7 +523,7 @@ Panel {
               Text {
                 visible: service && service.missingTool
                 width: parent.width
-                text: "secret-tool (libsecret) and curl are required and should already be installed on Omarchy."
+                text: service ? service.missingToolMessage : ""
                 color: root.dim
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.bodySmall
@@ -511,7 +535,7 @@ Panel {
                 visible: !(service && service.missingTool)
                 x: Math.round((parent.width - width) / 2)
                 text: service && service.setupRunning ? "Setup running…" : root.setupPlanValue.buttonLabel
-                enabled: !(service && (service.setupRunning || service.setupChecking))
+                enabled: service && service.toolsReady && !(service.setupRunning || service.setupChecking)
                 bordered: true
                 foreground: root.foreground
                 background: Color.popups.background
