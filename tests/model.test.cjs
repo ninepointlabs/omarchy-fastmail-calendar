@@ -20,6 +20,10 @@ const B = "0123456789abcdef" // a fixed response-framing boundary for the tests
 const TOOLS = {}
 for (const name of Model.requiredExecutables.concat(Model.optionalExecutables)) TOOLS[name] = "/usr/bin/" + name
 for (const name of Model.requiredOmarchyCommands) TOOLS[name] = "/usr/share/omarchy/bin/" + name
+const SUPERVISOR = "/home/someone/.config/omarchy/plugins/fastmail-calendar/bin/bounded-run"
+TOOLS[Model.supervisorToolName] = SUPERVISOR
+// The fixed prefix every supervised command starts with.
+const SUPERVISED = ["/usr/bin/python3", "-I", "-S", "-B", SUPERVISOR]
 
 // Every external tool named in the reviewed attack surface. A generated
 // script may only ever name these as an absolute path.
@@ -359,30 +363,65 @@ test("the tool probe searches only the fixed directories, using shell builtins",
   assert.doesNotMatch(script, /type -p/)
   for (const name of Model.requiredExecutables.concat(Model.requiredOmarchyCommands))
     assert.ok(script.includes(" " + name + " ") || script.includes(" " + name + ";"), "probes for " + name)
+  assert.ok(Model.requiredExecutables.includes("python3"), "the supervisor's interpreter is a required tool")
+  for (const retired of ["setpriv", "setsid", "sleep"])
+    assert.ok(!Model.requiredExecutables.includes(retired), retired + " is no longer part of the boundary")
+  // The supervisor script is only tested for presence ($1), never run.
+  assert.match(script, /if \[ -n "\$1" \] && \[ -f "\$1" \] && \[ ! -L "\$1" \] && \[ -r "\$1" \]; then printf '%s\\n' 'bounded-run present'; fi$/)
   // Only an absolute candidate can be the probe's own shell.
-  assert.deepEqual(Model.toolResolutionCommand("bash"), [])
-  assert.deepEqual(Model.toolResolutionCommand("/tmp/bash"), [])
-  assert.equal(Model.toolResolutionCommand("/usr/bin/bash")[0], "/usr/bin/bash")
+  assert.deepEqual(Model.toolResolutionCommand("bash", SUPERVISOR), [])
+  assert.deepEqual(Model.toolResolutionCommand("/tmp/bash", SUPERVISOR), [])
+  assert.equal(Model.toolResolutionCommand("/usr/bin/bash", SUPERVISOR)[0], "/usr/bin/bash")
+  assert.equal(Model.toolResolutionCommand("/usr/bin/bash", SUPERVISOR)[4], SUPERVISOR)
+  assert.equal(Model.toolResolutionCommand("/usr/bin/bash", "bin/bounded-run")[4], "")
   for (const candidate of Model.bashCandidates)
     assert.equal(Model.validAbsoluteExecutable(candidate), candidate)
 })
 
+test("validSupervisorScript accepts only a plain absolute path to bin/bounded-run", () => {
+  assert.equal(Model.validSupervisorScript(SUPERVISOR), SUPERVISOR)
+  assert.equal(Model.validSupervisorScript("/home/a b/plugins/x/bin/bounded-run"), "/home/a b/plugins/x/bin/bounded-run")
+  for (const hostile of ["bin/bounded-run", "/home/x/bin/bounded-run.sh", "/home/x/bin/other",
+                         "/home/x/../y/bin/bounded-run", "/home/x/./bin/bounded-run", "/home//x/bin/bounded-run",
+                         "/home/x\n/bin/bounded-run", "", undefined, "/" + "a/".repeat(600) + "bin/bounded-run"])
+    assert.equal(Model.validSupervisorScript(hostile), "", String(hostile))
+})
+
 test("parseToolTable keeps trusted paths and fails closed on anything else", () => {
-  const lines = Object.entries(TOOLS).map(([name, path]) => name + " " + path).join("\n")
-  const table = Model.parseToolTable(lines + "\n")
+  const systemTools = Object.assign({}, TOOLS)
+  delete systemTools[Model.supervisorToolName]
+  const lines = Object.entries(systemTools).map(([name, path]) => name + " " + path).join("\n") + "\nbounded-run present"
+  const table = Model.parseToolTable(lines + "\n", SUPERVISOR)
   assert.equal(table.ok, true)
   assert.deepEqual(table.missing, [])
   assert.equal(table.tools.curl, "/usr/bin/curl")
+  assert.equal(table.tools["bounded-run"], SUPERVISOR)
 
   // One required tool absent: no partial table, and a message naming it.
-  const without = Model.parseToolTable(lines.split("\n").filter(l => !l.startsWith("curl ")).join("\n"))
+  const without = Model.parseToolTable(lines.split("\n").filter(l => !l.startsWith("curl ")).join("\n"), SUPERVISOR)
   assert.equal(without.ok, false)
   assert.deepEqual(without.missing, ["curl"])
   assert.match(without.error, /curl/)
 
+  // No python3 in a trusted directory: nothing runs.
+  const noPython = Model.parseToolTable(lines.split("\n").filter(l => !l.startsWith("python3 ")).join("\n"), SUPERVISOR)
+  assert.equal(noPython.ok, false)
+  assert.deepEqual(noPython.missing, ["python3"])
+
+  // The supervisor script missing from the checkout, or its path unusable,
+  // or a probe line trying to name it as a system tool.
+  for (const [raw, script] of [[lines.replace("\nbounded-run present", ""), SUPERVISOR],
+                               [lines, "bin/bounded-run"],
+                               [lines.replace("bounded-run present", "bounded-run /usr/bin/bounded-run"), SUPERVISOR]]) {
+    const missingSupervisor = Model.parseToolTable(raw, script)
+    assert.equal(missingSupervisor.ok, false)
+    assert.deepEqual(missingSupervisor.missing, ["bounded-run"])
+    assert.match(missingSupervisor.error, /process supervisor/)
+  }
+
   // A probe line pointing outside the trusted directories is dropped, not
   // trusted — the tool then reads as missing.
-  const shadowed = Model.parseToolTable(lines.replace("curl /usr/bin/curl", "curl /home/someone/bin/curl"))
+  const shadowed = Model.parseToolTable(lines.replace("curl /usr/bin/curl", "curl /home/someone/bin/curl"), SUPERVISOR)
   assert.equal(shadowed.ok, false)
   assert.deepEqual(shadowed.missing, ["curl"])
 
@@ -412,50 +451,82 @@ test("every command builder returns nothing until the tool table resolves", () =
     // A table carrying an untrusted path is no better than an empty one.
     const shadowed = Object.assign({}, TOOLS, { bash: "/home/someone/bin/bash" })
     assert.deepEqual(build(shadowed), [], "untrusted bash")
+    assert.deepEqual(build(Object.assign({}, TOOLS, { python3: "/home/someone/bin/python3" })), [], "untrusted python3")
+    const noSupervisor = Object.assign({}, TOOLS)
+    delete noSupervisor[Model.supervisorToolName]
+    assert.deepEqual(build(noSupervisor), [], "no supervisor script")
     assert.ok(build(TOOLS).length > 0, "resolved table")
   }
   // Likewise the script builders, which the command builders read.
-  for (const build of [Model.boundedCaptureScript, Model.accountInfoShell, Model.caldavCredentialShell,
+  for (const build of [Model.accountInfoShell, Model.caldavCredentialShell,
                        Model.caldavRequestShell, Model.caldavWindowShell, Model.caldavPutShell,
                        Model.setupLockShell, Model.setupCredentialsScript, Model.curlBase, Model.curlCommon])
     assert.equal(build({}), "")
   assert.equal(Model.setupLaunchScript({}, "x"), "")
 })
 
-test("the bounded-capture guard is built entirely from absolute paths", () => {
+const scriptOf = command => command[command.indexOf("-c") + 1]
+
+test("every automatic process runs under the supervisor, started from absolute paths only", () => {
   const command = Model.boundedCaptureCommand(TOOLS, ["/usr/bin/secret-tool", "lookup"])
-  assert.equal(command[0], "/usr/bin/setpriv")
-  assert.deepEqual(command.slice(1, 7), ["--pdeathsig", "TERM", "/usr/bin/bash", "-o", "pipefail", "-c"])
-  const script = command[7]
-  // The output cap, the process-group kill and the deadline all run through
-  // the table; `kill` and `wait` are bash builtins, which take precedence
-  // over PATH and so are not shadowable.
-  assert.match(script, /\/usr\/bin\/head -c "\$\(\(stdout_limit \+ 1\)\)"/)
-  assert.match(script, /\/usr\/bin\/head -c "\$\(\(stderr_limit \+ 1\)\)" >&2/)
-  assert.match(script, /\/usr\/bin\/setpriv --pdeathsig KILL \/usr\/bin\/setsid "\$@"/)
-  assert.match(script, /\/usr\/bin\/setpriv --pdeathsig KILL \/usr\/bin\/setsid \/usr\/bin\/bash -c/)
-  assert.match(script, /\/usr\/bin\/sleep 0\.1/)
-  assert.match(script, new RegExp("^PATH=" + Model.trustedPathEnvironment.replace(/[./]/g, "\\$&") + "; export PATH; "))
-  assert.deepEqual(bareInvocations(script), [])
+  assert.deepEqual(command, SUPERVISED.concat(["--stdout-cap", "1048576", "--stderr-cap", "65536",
+    "--deadline", "25", "--grace", "2", "--", "/usr/bin/secret-tool", "lookup"]))
+  // No shell guard and no background killer: nothing in the argv can signal
+  // a PID or process group by number.
+  assert.ok(!command.some(part => /\bkill\b|setsid|setpriv|sleep|\$!|\$\$/.test(part)))
   // The captured command's own program has to be absolute and trusted too.
   assert.deepEqual(Model.boundedCaptureCommand(TOOLS, ["curl", "-sS"]), [])
   assert.deepEqual(Model.boundedCaptureCommand(TOOLS, ["/usr/local/bin/curl"]), [])
   assert.deepEqual(Model.boundedCaptureCommand(TOOLS, []), [])
-  // Behavior the boundary depends on is unchanged.
-  assert.deepEqual(command.slice(8, 13), ["fmcal-output-guard", "1048576", "65536", "25", "2"])
-  assert.equal(Model.boundedCaptureCommand(TOOLS, ["/usr/bin/curl"], 4096, 512, 0, 7)[12], "7")
-  assert.equal(Model.boundedCaptureCommand(TOOLS, ["/usr/bin/curl"], 4096, 512, 0, 7)[11], "0")
+  assert.deepEqual(Model.boundedCaptureCommand(Object.assign({}, TOOLS, { "bounded-run": "bin/bounded-run" }), ["/usr/bin/curl"]), [])
+  assert.deepEqual(Model.boundedCaptureCommand(TOOLS, ["/usr/bin/curl"], 4096, 512, 0, 7).slice(5, 14),
+    ["--stdout-cap", "4096", "--stderr-cap", "512", "--deadline", "0", "--grace", "7", "--"])
+
+  // Every generated script is the supervised command, run as bash by
+  // absolute path with no startup files.
+  const supervised = {
+    lookup: Model.secretLookupCommand(TOOLS),
+    clear: Model.secretClearCommand(TOOLS),
+    account: Model.accountInfoCommand(TOOLS),
+    request: Model.caldavRequestCommand(TOOLS, "PROPFIND", "0", "https://x.example/", "<x/>", B),
+    window: Model.caldavWindowCommand(TOOLS, "https://x.example", ["/dav/a/"], 0, 1, B),
+    put: Model.caldavPutCommand(TOOLS, "https://x.example/a.ics", "BEGIN:VCALENDAR", B),
+    setupLock: Model.setupLockCheckCommand(TOOLS)
+  }
+  for (const [name, argv] of Object.entries(supervised)) {
+    assert.deepEqual(argv.slice(0, 5), SUPERVISED, name)
+    const at = argv.indexOf("--")
+    assert.ok(at > 0, name)
+    if (name === "lookup" || name === "clear") assert.equal(argv[at + 1], "/usr/bin/secret-tool", name)
+    else assert.deepEqual(argv.slice(at + 1, at + 5), ["/usr/bin/bash", "--noprofile", "--norc", "-c"], name)
+  }
+  assert.equal(Model.caldavWindowCommand(TOOLS, "https://x.example", [], 0, 1, B)[10], "90")
+  assert.equal(Model.setupLockCheckCommand(TOOLS)[10], "10")
+})
+
+test("captureFailure maps supervisor outcomes and leaves the command's own failures alone", () => {
+  // A capped response arrives as exactly the cap plus status 201, so it must
+  // read as too large, not as a parse error on the truncated body.
+  assert.match(Model.captureFailure(201, "<D:multistatus", "").error, /exceeded its size limit/)
+  assert.equal(Model.captureFailure(201, "", "").code, "http")
+  assert.match(Model.captureFailure(202, "", "x").error, /error output exceeded its size limit/)
+  assert.equal(Model.captureFailure(124, "", "").code, "network")
+  for (const status of [125, 126, 127]) assert.equal(Model.captureFailure(status, "", "").code, "missing_tool")
+  for (const status of [129, 130, 143]) assert.match(Model.captureFailure(status, "", "").error, /stopped/)
+  const own = Model.captureFailure(1, "", '{"ok":false,"error":"No calendar credentials stored","code":"no_credentials"}')
+  assert.equal(own.code, "no_credentials")
+  for (const status of [124, 125, 126, 127, 129, 130, 143, 201, 202]) assert.equal(Model.isSupervisorOutcome(status), true, String(status))
+  for (const status of [0, 1, 2, 75, 76, 255]) assert.equal(Model.isSupervisorOutcome(status), false, String(status))
 })
 
 test("no generated script names a bound tool without its absolute path", () => {
   const scripts = {
-    boundedCapture: Model.boundedCaptureScript(TOOLS),
     accountInfo: Model.accountInfoShell(TOOLS),
     credentials: Model.caldavCredentialShell(TOOLS),
     request: Model.caldavRequestShell(TOOLS),
     window: Model.caldavWindowShell(TOOLS),
     put: Model.caldavPutShell(TOOLS),
-    setupLock: Model.setupLockCheckCommand(TOOLS)[2],
+    setupLock: scriptOf(Model.setupLockCheckCommand(TOOLS)),
     setupCredentials: Model.setupCredentialsScript(TOOLS),
     setupLaunch: Model.setupLaunchScript(TOOLS, "ninepointlabs.fastmail-calendar")
   }
@@ -469,7 +540,7 @@ test("no generated script names a bound tool without its absolute path", () => {
   }
   // The detector has to be able to fail: a script naming a tool bare is caught.
   assert.deepEqual(bareInvocations("curl -sS https://x; sed -n 1p"), ["curl", "sed"])
-  assert.deepEqual(bareInvocations("/usr/bin/setpriv --pdeathsig KILL setsid /usr/bin/bash"), ["setsid"])
+  assert.deepEqual(bareInvocations("/usr/bin/env flock -n 9"), ["flock"])
   // A tool name in argument position is a subcommand, not a lookup.
   assert.deepEqual(bareInvocations("/usr/bin/secret-tool clear service x"), [])
 })

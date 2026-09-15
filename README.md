@@ -135,13 +135,28 @@ the same as every other Ninepoint Labs Omarchy plugin.
   required tool is not found in one of those directories the plugin **fails
   closed**: every command it would build comes back empty, nothing runs, and
   the panel says which tool is missing. This covers the whole surface —
-  `setpriv`, `setsid`, `bash`, `head` and `sleep` inside the bounded-capture
-  guard, and `secret-tool`, `curl`, `grep`, `sed`, `tr`, `cut`, `awk`,
-  `stty`, `id`, `stat`, `mkdir`, `chmod` and `flock` on the credential and
-  setup paths. A shadow binary earlier in your `PATH` therefore cannot see
-  the app password, redirect a CalDAV request, or defeat the output and
-  deadline controls. (`kill`, `wait`, `trap`, `printf` and `read` are bash
-  builtins: builtins take precedence over `PATH` and cannot be shadowed.)
+  `python3` for the process supervisor, and `bash`, `head`, `secret-tool`,
+  `curl`, `grep`, `sed`, `tr`, `cut`, `awk`, `stty`, `id`, `stat`, `mkdir`,
+  `chmod` and `flock` on the credential and setup paths. A shadow binary
+  earlier in your `PATH` therefore cannot see the app password, redirect a
+  CalDAV request, or defeat the output and deadline controls. (`trap`,
+  `printf` and `read` are bash builtins: builtins take precedence over
+  `PATH` and cannot be shadowed.)
+- **Every command runs under a race-free supervisor.** `bin/bounded-run`
+  (Python standard library, started as `python3 -I -S -B` so no `PYTHON*`
+  variable or user site directory reaches it) caps each output stream,
+  enforces a deadline, and ends the whole process tree. The command starts
+  in its own session, so its process-group ID is its PID; the supervisor is
+  its direct parent and does not reap it until every signal has been sent,
+  and until then the kernel keeps that PID — and so that group ID —
+  allocated, so a group signal can only reach the original group. The
+  supervisor is also a child subreaper: descendants that escape the group
+  are re-parented to it, are signalled only while they are its own
+  unreaped children, and are all reaped before it exits. No background
+  helper ever signals a bare PID or group number, and nothing is signalled
+  after the command has been reaped. If the supervisor itself is killed,
+  the command's parent-death signal ends it. At most the cap is passed on
+  from each stream; one byte more ends the job.
 - **Subprocesses get a minimal, closed environment, not your session's.**
   `PATH` is replaced with the trusted directories, the locale is pinned to
   `C`, and the only variables carried over are `XDG_RUNTIME_DIR`,
@@ -197,10 +212,12 @@ the same as every other Ninepoint Labs Omarchy plugin.
 
 For reviewers, this is everything the plugin executes:
 
-Each of these runs through the bounded-capture guard
-(`/usr/bin/setpriv --pdeathsig TERM /usr/bin/bash -o pipefail -c …`), with
+Each of these runs under the supervisor
+(`/usr/bin/python3 -I -S -B <plugin>/bin/bounded-run --stdout-cap N --stderr-cap N --deadline S --grace S -- …`),
+the request scripts as `/usr/bin/bash --noprofile --norc -c …`, with
 `/usr/bin` standing in below for whichever trusted directory the tool
-actually resolved in:
+actually resolved in (the setup-lock check, `flock -n` on the private lock
+directory, runs under the same supervisor):
 
 ```text
 /usr/bin/secret-tool search  service ninepointlabs.fastmail-calendar account caldav   (attributes only: server, username)
@@ -234,7 +251,16 @@ status and address). Reports welcome.
 
 ```bash
 node --test tests/model.test.cjs
+tests/bounded-run.test.sh bin/bounded-run
 ```
+
+`tests/bounded-run.test.sh` exercises the supervisor against real process
+trees — caps, deadline, TERM-ignoring and setsid-escaped descendants,
+double-forked daemons, parent death, a killed supervisor, fd and environment
+hygiene — and runs `tests/bounded-run-race.py`, which wraps the supervisor's
+`kill`/`killpg`/`waitid` calls and fails if any signal names a process that
+is not its own unreaped child, or is sent after the command has been reaped,
+while unrelated process groups churn alongside.
 
 Pure JS: date/grid math, timezone-safe recurrence expansion, CalDAV
 discovery and request framing, WebDAV multistatus and iCalendar parsing

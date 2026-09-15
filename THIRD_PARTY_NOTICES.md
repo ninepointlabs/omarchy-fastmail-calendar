@@ -2,8 +2,10 @@
 
 The month-grid/week date math in `Model.js` (`monthGrid`, `weekDays`,
 `dateKey`, `isoWeek`, `weekdayOrder`, `stepMonth`, `stepWeek`,
-`normalizedWeekStart`), the bounded-capture process wrapper
-(`boundedCaptureCommand` / `boundedCaptureScript`), the panel/day-detail/bar
+`normalizedWeekStart`), the bounded-capture interface (`boundedCaptureCommand`:
+output caps, a deadline and process-group termination — now enforced by this
+plugin's own `bin/bounded-run` supervisor rather than the original shell
+guard), the panel/day-detail/bar
 widget layout in `Panel.qml`, `DayDetail.qml` and `BarWidget.qml`, and the
 overall Service.qml process-orchestration shape are adapted from Ninepoint
 Labs' `omarchy-hey-calendar` plugin (MIT License, Copyright (c) 2026
