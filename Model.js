@@ -570,11 +570,13 @@ var trustedOmarchyDirectories = ["/usr/bin", "/bin", "/usr/share/omarchy/bin", "
 var bashCandidates = ["/usr/bin/bash", "/bin/bash", "/run/current-system/sw/bin/bash"]
 
 // Every external tool on a capture, credential or setup path. Nothing runs
-// until all of them resolve. `kill`, `printf`, `read`, `wait`, `trap`, `[`
-// and `command` are bash builtins — builtins take precedence over PATH and
-// cannot be shadowed by a directory entry, so they are not listed here.
+// until all of them resolve. `printf`, `read`, `trap`, `[` and `command` are
+// bash builtins — builtins take precedence over PATH and cannot be shadowed
+// by a directory entry, so they are not listed here. `python3` runs the
+// process supervisor (bin/bounded-run, standard library only) and nothing
+// else.
 var requiredExecutables = [
-  "bash", "setpriv", "setsid", "sleep", "head",
+  "bash", "python3", "head",
   "secret-tool", "curl", "grep", "sed",
   "tr", "cut", "awk", "stty",
   "id", "stat", "mkdir", "chmod", "flock"
@@ -625,10 +627,36 @@ function toolPath(tools, name) {
   return validAbsoluteExecutable(tools[name])
 }
 
+// The process supervisor is the one program that is not a system tool: it
+// ships in this checkout as bin/bounded-run and is run by the trusted
+// python3 above, never executed directly. It sits in the table under its own
+// key and is accepted only as a plain absolute path ending in
+// /bin/bounded-run — no relative or empty segment, no control character.
+// It is an argv element, never written into a script.
+var supervisorToolName = "bounded-run"
+var supervisorScriptSuffix = "/bin/bounded-run"
+
+function validSupervisorScript(value) {
+  var text = String(value === undefined || value === null ? "" : value)
+  if (text === "" || text.length > 1024 || text.charAt(0) !== "/") return ""
+  if (/[\x00-\x1f\x7f]/.test(text)) return ""
+  if (text.substring(text.length - supervisorScriptSuffix.length) !== supervisorScriptSuffix) return ""
+  var segments = text.substring(1).split("/")
+  for (var i = 0; i < segments.length; i++)
+    if (segments[i] === "" || segments[i] === "." || segments[i] === "..") return ""
+  return text
+}
+
+function supervisorPath(tools) {
+  if (!tools || typeof tools !== "object" || Array.isArray(tools)) return ""
+  return validSupervisorScript(tools[supervisorToolName])
+}
+
 function missingTools(tools) {
   var names = requiredExecutables.concat(requiredOmarchyCommands)
   var missing = []
   for (var i = 0; i < names.length; i++) if (toolPath(tools, names[i]) === "") missing.push(names[i])
+  if (supervisorPath(tools) === "") missing.push(supervisorToolName)
   return missing
 }
 
@@ -649,30 +677,42 @@ function toolResolutionScript() {
     + "for n in " + requiredOmarchyCommands.join(" ") + "; do "
     + "for d in " + trustedOmarchyDirectories.join(" ") + "; do "
     + "if [ -x \"$d/$n\" ]; then printf '%s %s\\n' \"$n\" \"$d/$n\"; break; fi; "
-    + "done; done"
+    + "done; done; "
+    // $1 is the checkout's supervisor script; it is only tested, never run.
+    + "if [ -n \"$1\" ] && [ -f \"$1\" ] && [ ! -L \"$1\" ] && [ -r \"$1\" ]; then printf '%s\\n' '" + supervisorToolName + " present'; fi"
 }
 
-function toolResolutionCommand(bashPath) {
+function toolResolutionCommand(bashPath, supervisorScript) {
   var shell = validAbsoluteExecutable(bashPath)
-  return shell === "" ? [] : [shell, "-c", toolResolutionScript(), "fmcal-tool-probe"]
+  return shell === "" ? [] : [shell, "-c", toolResolutionScript(), "fmcal-tool-probe", validSupervisorScript(supervisorScript)]
 }
 
-function parseToolTable(raw) {
+function parseToolTable(raw, supervisorScript) {
   var tools = {}
   var lines = String(raw || "").split("\n")
   for (var i = 0; i < lines.length && i < 128; i++) {
+    if (lines[i] === supervisorToolName + " present") {
+      var script = validSupervisorScript(supervisorScript)
+      if (script !== "") tools[supervisorToolName] = script
+      continue
+    }
     var match = lines[i].match(/^([a-z][a-z0-9-]{0,63}) (\/[^\s]+)$/)
-    if (!match) continue
+    if (!match || match[1] === supervisorToolName) continue
     var resolved = validAbsoluteExecutable(match[2])
     if (resolved !== "" && tools[match[1]] === undefined) tools[match[1]] = resolved
   }
   var missing = missingTools(tools)
+  var systemMissing = missing.filter(function(name) { return name !== supervisorToolName })
+  var problems = []
+  if (systemMissing.length > 0)
+    problems.push("Not found in " + trustedBinaryDirectories.join(", ") + ": " + systemMissing.join(", "))
+  if (missing.length !== systemMissing.length)
+    problems.push("The plugin's process supervisor (bin/bounded-run) is missing from its checkout")
   return {
     ok: missing.length === 0,
     tools: tools,
     missing: missing,
-    error: missing.length === 0 ? ""
-      : "Not found in " + trustedBinaryDirectories.join(", ") + ": " + missing.join(", ")
+    error: problems.join("; ")
   }
 }
 
@@ -702,12 +742,34 @@ function minimalEnvironment(inherited) {
 }
 
 // ---------------------------------------------------------------------------
-// Bounded, hardened process invocation — output size caps, a timeout, and a
-// process-group kill on exit, adapted from omarchy-hey-calendar's Model.js
-// (itself from 37signals.hey's); see THIRD_PARTY_NOTICES.md. Every control
-// tool the guard itself uses (setpriv, setsid, the nested shell, head, sleep)
-// comes from the resolved table, so the boundary is not built out of
-// anything the session PATH can reach.
+// Bounded, race-free process invocation — output size caps, a deadline, and
+// termination of the whole process tree, enforced by bin/bounded-run: a small
+// supervisor in the Python standard library, run by the trusted python3 from
+// the table with -I -S -B, so no PYTHON* variable, user site directory or
+// script-relative import can reach it. The caps, deadline and group
+// termination are adapted from omarchy-hey-calendar's bounded-capture guard
+// (itself from 37signals.hey's); see THIRD_PARTY_NOTICES.md.
+//
+// Why a supervisor and not a shell guard with background killers: a helper
+// that later signals `-$pid` is acting on a bare number, and once the group
+// is gone and its PID reused that number can name an unrelated process
+// group. bounded-run removes that window by construction:
+//   - the command starts in its own session, so its PGID equals its PID;
+//   - bounded-run is its direct parent and does not reap it until every
+//     signal has been sent. Until it is reaped — even as a zombie — the
+//     kernel keeps that PID, and therefore that PGID, allocated, so a group
+//     signal can only reach the original group;
+//   - bounded-run is a child subreaper: descendants orphaned inside or
+//     outside the group are re-parented to it, are signalled only after it
+//     has confirmed each is still its own unreaped child, and are all reaped
+//     before it exits (the leader last);
+//   - nothing is ever signalled from an asynchronous helper, and nothing is
+//     signalled after the leader is reaped;
+//   - if bounded-run is itself killed outright, the command's parent-death
+//     signal (SIGKILL) ends it; if Quickshell goes away, bounded-run's own
+//     parent-death signal (SIGTERM) runs the full cleanup.
+// At most the cap is forwarded on each stream; the first byte past it ends
+// the job with a distinct status (supervisorExit below).
 // ---------------------------------------------------------------------------
 
 var cliResponseByteLimit = 1024 * 1024
@@ -715,58 +777,59 @@ var cliErrorByteLimit = 64 * 1024
 var finiteCommandTimeoutSec = 25
 var finiteCommandKillGraceSec = 2
 
-// The guard script. Everything it starts is an absolute path from the
-// resolved table; `kill`, `wait`, `trap` and `[` are bash builtins, which
-// take precedence over PATH and so cannot be shadowed. PATH is pinned as
-// well, so anything reached indirectly still cannot come from a user
-// directory.
-function boundedCaptureScript(tools) {
-  if (!toolsResolved(tools)) return ""
-  var setpriv = toolPath(tools, "setpriv")
-  var bash = toolPath(tools, "bash")
-  var setsid = toolPath(tools, "setsid")
-  var sleep = toolPath(tools, "sleep")
-  var head = toolPath(tools, "head")
-  if (setpriv === "" || bash === "" || setsid === "" || sleep === "" || head === "") return ""
-  var detach = setpriv + " --pdeathsig KILL " + setsid
-  return "PATH=" + trustedPathEnvironment + "; export PATH; "
-    + "stdout_limit=$1; stderr_limit=$2; deadline=$3; grace=$4; shift 4; child_pid=; timer_pid=; killer_pid=; timed_out=0; "
-    + "stop_timer() { if [ -n \"$timer_pid\" ]; then kill -TERM -- \"-$timer_pid\" 2>/dev/null || true; kill -TERM \"$timer_pid\" 2>/dev/null || true; wait \"$timer_pid\" 2>/dev/null || true; timer_pid=; fi; }; "
-    + "start_group_killer() { " + detach + " " + bash + " -c 'end=$((SECONDS + $1)); while kill -0 -- \"-$2\" 2>/dev/null && [ \"$SECONDS\" -lt \"$end\" ]; do " + sleep + " 0.1; done; kill -KILL -- \"-$2\" 2>/dev/null || true' fmcal-output-killer \"$grace\" \"$child_pid\" & killer_pid=$!; }; "
-    + "wait_group_killer() { if [ -n \"$killer_pid\" ]; then wait \"$killer_pid\" 2>/dev/null || true; killer_pid=; fi; }; "
-    + "cleanup_group() { if [ -n \"$child_pid\" ] && kill -0 -- \"-$child_pid\" 2>/dev/null; then kill -TERM -- \"-$child_pid\" 2>/dev/null || true; start_group_killer; wait_group_killer; fi; }; "
-    + "terminate_child() { if [ -n \"$child_pid\" ]; then kill -TERM -- \"-$child_pid\" 2>/dev/null || true; kill -TERM \"$child_pid\" 2>/dev/null || true; start_group_killer; wait \"$child_pid\" 2>/dev/null || true; wait_group_killer; child_pid=; fi; }; "
-    + "stop_child() { trap - HUP INT TERM USR1; stop_timer; terminate_child; exit 143; }; "
-    + "trap 'timed_out=1' USR1; trap stop_child HUP INT TERM; "
-    + detach + " \"$@\" "
-    + "> >(" + head + " -c \"$((stdout_limit + 1))\") "
-    + "2> >(" + head + " -c \"$((stderr_limit + 1))\" >&2) & child_pid=$!; "
-    + "if [ \"$deadline\" -gt 0 ]; then parent_pid=$BASHPID; "
-    + detach + " " + bash + " -c '" + sleep + " \"$1\" || exit 0; kill -USR1 \"$2\" 2>/dev/null || exit 0; kill -TERM -- \"-$3\" 2>/dev/null || true; kill -TERM \"$3\" 2>/dev/null || true; end=$((SECONDS + $4)); while kill -0 -- \"-$3\" 2>/dev/null && [ \"$SECONDS\" -lt \"$end\" ]; do " + sleep + " 0.1; done; if kill -0 -- \"-$3\" 2>/dev/null; then kill -KILL -- \"-$3\" 2>/dev/null || true; fi' "
-    + "fmcal-output-timeout \"$deadline\" \"$parent_pid\" \"$child_pid\" \"$grace\" & timer_pid=$!; fi; "
-    + "wait \"$child_pid\"; status=$?; "
-    + "if [ \"$timed_out\" -eq 1 ]; then wait \"$child_pid\" 2>/dev/null || true; status=124; wait \"$timer_pid\" 2>/dev/null || true; timer_pid=; "
-    + "else stop_timer; cleanup_group; fi; child_pid=; exit \"$status\""
-}
+var supervisorExit = { timeout: 124, usage: 125, notExecutable: 126, notFound: 127, stdoutCap: 201, stderrCap: 202 }
 
 // `command` is an argv vector whose first element must already be an absolute
 // path from the resolved table. An unresolved table yields [] — a Process
 // given an empty command starts nothing, which is the fail-closed outcome.
 function boundedCaptureCommand(tools, command, stdoutLimit, stderrLimit, timeoutSeconds, killGraceSeconds) {
   if (!toolsResolved(tools)) return []
-  var setpriv = toolPath(tools, "setpriv")
-  var bash = toolPath(tools, "bash")
-  var script = boundedCaptureScript(tools)
+  var python = toolPath(tools, "python3")
+  var supervisor = supervisorPath(tools)
   var source = Array.isArray(command) ? command : []
-  if (setpriv === "" || bash === "" || script === "" || source.length === 0) return []
+  if (python === "" || supervisor === "" || source.length === 0) return []
   if (validAbsoluteExecutable(source[0]) === "") return []
   var stdoutBytes = positiveInteger(stdoutLimit, cliResponseByteLimit)
   var stderrBytes = positiveInteger(stderrLimit, cliErrorByteLimit)
   var deadline = timeoutSeconds === 0 ? 0 : positiveInteger(timeoutSeconds, finiteCommandTimeoutSec)
   var grace = positiveInteger(killGraceSeconds, finiteCommandKillGraceSec)
-  return [setpriv, "--pdeathsig", "TERM", bash, "-o", "pipefail", "-c",
-    script, "fmcal-output-guard", String(stdoutBytes), String(stderrBytes),
-    String(deadline), String(grace)].concat(source)
+  return [python, "-I", "-S", "-B", supervisor,
+    "--stdout-cap", String(stdoutBytes), "--stderr-cap", String(stderrBytes),
+    "--deadline", String(deadline), "--grace", String(grace), "--"].concat(source)
+}
+
+// A generated script run as the supervised command: bash by absolute path
+// from the table, with no startup files. (The environment is already
+// cleared, and bounded-run drops BASH_ENV/ENV/BASH_FUNC_* besides.)
+function shellCommand(tools, script, name, args) {
+  var bash = toolPath(tools, "bash")
+  if (bash === "" || !script) return []
+  return [bash, "--noprofile", "--norc", "-c", script, name].concat(Array.isArray(args) ? args : [])
+}
+
+// A supervisor outcome, mapped onto the same error/code envelope the request
+// scripts write. Any other non-zero status is the command's own failure.
+function captureFailure(exitCode, stdout, stderr) {
+  switch (exitCode) {
+  case supervisorExit.timeout:
+    return { ok: false, error: "The calendar server took too long to answer", code: "network" }
+  case supervisorExit.stdoutCap:
+    return { ok: false, error: "The calendar server response exceeded its size limit", code: "http" }
+  case supervisorExit.stderrCap:
+    return { ok: false, error: "The request's error output exceeded its size limit", code: "" }
+  case supervisorExit.usage:
+  case supervisorExit.notExecutable:
+  case supervisorExit.notFound:
+    return { ok: false, error: "Could not start the calendar's process supervisor (python3, bin/bounded-run)", code: "missing_tool" }
+  case 129: case 130: case 143:
+    return { ok: false, error: "The request was stopped", code: "" }
+  }
+  return parseFailure(stdout, stderr)
+}
+
+function isSupervisorOutcome(exitCode) {
+  for (var name in supervisorExit) if (supervisorExit[name] === exitCode) return true
+  return exitCode === 129 || exitCode === 130 || exitCode === 143
 }
 
 function shellQuote(value) {
@@ -940,10 +1003,7 @@ function accountInfoShell(tools) {
 
 function accountInfoCommand(tools) {
   if (!toolsResolved(tools)) return []
-  var bash = toolPath(tools, "bash")
-  var shell = accountInfoShell(tools)
-  if (bash === "" || shell === "") return []
-  return boundedCaptureCommand(tools, [bash, "-c", shell, "fmcal-account"], 4096, cliErrorByteLimit)
+  return boundedCaptureCommand(tools, shellCommand(tools, accountInfoShell(tools), "fmcal-account"), 4096, cliErrorByteLimit)
 }
 
 function parseAccountInfo(raw) {
@@ -1031,11 +1091,9 @@ function validBoundary(value) {
 
 function caldavRequestCommand(tools, method, depth, url, body, boundary, stdoutLimit) {
   if (!toolsResolved(tools)) return []
-  var bash = toolPath(tools, "bash")
-  var shell = caldavRequestShell(tools)
-  if (bash === "" || shell === "") return []
   return boundedCaptureCommand(tools,
-    [bash, "-c", shell, "fmcal-caldav", String(method || "PROPFIND"), String(depth || "0"), String(url || ""), String(body || ""), validBoundary(boundary)],
+    shellCommand(tools, caldavRequestShell(tools), "fmcal-caldav",
+      [String(method || "PROPFIND"), String(depth || "0"), String(url || ""), String(body || ""), validBoundary(boundary)]),
     stdoutLimit || cliResponseByteLimit, cliErrorByteLimit)
 }
 
@@ -1057,13 +1115,11 @@ var windowResponseByteLimit = 8 * 1024 * 1024
 
 function caldavWindowCommand(tools, origin, hrefs, startUtcMs, endUtcMs, boundary) {
   if (!toolsResolved(tools)) return []
-  var bash = toolPath(tools, "bash")
-  var shell = caldavWindowShell(tools)
-  if (bash === "" || shell === "") return []
-  var args = [bash, "-c", shell, "fmcal-caldav-window", String(origin || ""), calendarQueryBody(startUtcMs, endUtcMs), validBoundary(boundary)]
+  var args = [String(origin || ""), calendarQueryBody(startUtcMs, endUtcMs), validBoundary(boundary)]
   var list = Array.isArray(hrefs) ? hrefs : []
   for (var i = 0; i < list.length && i < 128; i++) args.push(String(list[i]))
-  return boundedCaptureCommand(tools, args, windowResponseByteLimit, cliErrorByteLimit, 90)
+  return boundedCaptureCommand(tools, shellCommand(tools, caldavWindowShell(tools), "fmcal-caldav-window", args),
+    windowResponseByteLimit, cliErrorByteLimit, 90)
 }
 
 // Splits curl's output into body + status trailer. A missing trailer means
@@ -1126,10 +1182,8 @@ function caldavPutShell(tools) {
 
 function caldavPutCommand(tools, url, body, boundary) {
   if (!toolsResolved(tools)) return []
-  var bash = toolPath(tools, "bash")
-  var shell = caldavPutShell(tools)
-  if (bash === "" || shell === "") return []
-  return boundedCaptureCommand(tools, [bash, "-c", shell, "fmcal-caldav-put", String(url || ""), String(body || ""), validBoundary(boundary)],
+  return boundedCaptureCommand(tools,
+    shellCommand(tools, caldavPutShell(tools), "fmcal-caldav-put", [String(url || ""), String(body || ""), validBoundary(boundary)]),
     cliResponseByteLimit, cliErrorByteLimit)
 }
 
@@ -1938,11 +1992,14 @@ function setupLockShell(tools) {
 
 function setupLockCheckCommand(tools) {
   if (!toolsResolved(tools)) return []
-  var bash = toolPath(tools, "bash")
   var flock = toolPath(tools, "flock")
   var lock = setupLockShell(tools)
-  if (bash === "" || flock === "" || lock === "") return []
-  return [bash, "-c", lock + "exec 9<\"$lock\"; " + flock + " -n 9", "fmcal-setup-lock"]
+  if (flock === "" || lock === "") return []
+  // Exit 0: free; 1: setup holds the lock; anything else: no private runtime
+  // directory. Supervised like every other automatic process.
+  return boundedCaptureCommand(tools,
+    shellCommand(tools, lock + "exec 9<\"$lock\"; " + flock + " -n 9", "fmcal-setup-lock"),
+    4096, 4096, 10)
 }
 
 // The credential-capture script: instructions, three prompts (the password
@@ -2284,7 +2341,9 @@ if (typeof module !== "undefined") {
     toolsResolved: toolsResolved, missingTools: missingTools,
     toolResolutionScript: toolResolutionScript, toolResolutionCommand: toolResolutionCommand,
     parseToolTable: parseToolTable,
-    boundedCaptureScript: boundedCaptureScript,
+    supervisorToolName: supervisorToolName, validSupervisorScript: validSupervisorScript,
+    supervisorPath: supervisorPath, supervisorExit: supervisorExit,
+    shellCommand: shellCommand, captureFailure: captureFailure, isSupervisorOutcome: isSupervisorOutcome,
     boundedCaptureCommand: boundedCaptureCommand, shellQuote: shellQuote,
     cliResponseByteLimit: cliResponseByteLimit, cliErrorByteLimit: cliErrorByteLimit,
     parseJson: parseJson, parseFailure: parseFailure, isAuthError: isAuthError,
