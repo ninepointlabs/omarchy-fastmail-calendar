@@ -111,6 +111,15 @@ Item {
 
   readonly property var toolProbeEnvironment: Model.probeEnvironment()
 
+  // The process supervisor ships in this checkout (bin/bounded-run). Model
+  // validates the path; anything that is not a plain local file path leaves
+  // the tool table incomplete, and nothing runs.
+  readonly property string supervisorScript: {
+    var text = String(Qt.resolvedUrl("bin/bounded-run"))
+    if (text.indexOf("file://") !== 0) return ""
+    try { return decodeURIComponent(text.substring(7)) } catch (error) { return "" }
+  }
+
   property int _bashCandidate: 0
   property bool _probeStarted: false
   property bool _probeSettled: false
@@ -129,7 +138,7 @@ Item {
         + " — the calendar will not run commands through the session PATH")
       return
     }
-    var command = Model.toolResolutionCommand(candidates[_bashCandidate])
+    var command = Model.toolResolutionCommand(candidates[_bashCandidate], supervisorScript)
     if (command.length === 0) { _bashCandidate++; startToolProbe(); return }
     toolsProbing = true
     _probeStarted = false
@@ -168,7 +177,7 @@ Item {
       // Started but said nothing usable, or never started at all: try the
       // next absolute candidate rather than widening the search.
       if (!root._probeStarted) { root._bashCandidate++; root.startToolProbe(); return }
-      var table = Model.parseToolTable(String(toolProbeStdout.text || root._probeOut || ""))
+      var table = Model.parseToolTable(String(toolProbeStdout.text || root._probeOut || ""), root.supervisorScript)
       if (!table.ok) {
         root.failToolResolution("The calendar needs tools it could not find. " + table.error)
         return
@@ -245,6 +254,14 @@ Item {
     command: Model.accountInfoCommand(root.tools)
     stdout: StdioCollector { id: accountStdout; waitForEnd: true; onStreamFinished: root._accountOut = text }
     onExited: function(exitCode) {
+      // A deadline, a size cap or a supervisor that could not start is not
+      // "no credentials": report it as such instead of sending the viewer
+      // back to setup.
+      if (Model.isSupervisorOutcome(exitCode)) {
+        var failure = Model.captureFailure(exitCode, "", "")
+        root.failProbe(failure.error, failure.code)
+        return
+      }
       var info
       try { info = Model.parseAccountInfo(String(accountStdout.text || root._accountOut || "")) } catch (error) { info = { server: "", username: "" } }
       if (exitCode !== 0 || info.server === "" || info.username === "") {
@@ -299,7 +316,7 @@ Item {
 
   function finishStep(exitCode, stdout, stderr) {
     if (exitCode !== 0) {
-      var failure = Model.parseFailure(stdout, stderr)
+      var failure = Model.captureFailure(exitCode, stdout, stderr)
       failProbe(failure.error, failure.code)
       return
     }
@@ -461,7 +478,7 @@ Item {
       root.windowLoading = false
       root.windowLoadedAtMs = Date.now()
       if (exitCode !== 0) {
-        var failure = Model.parseFailure(stdout, stderr)
+        var failure = Model.captureFailure(exitCode, stdout, stderr)
         if (Model.isAuthError(failure.code)) { root.authenticated = false; root.lastError = root.conciseError(failure.error, ""); return }
         root.windowError = root.conciseError(failure.error, "Could not load events")
       } else {
@@ -526,7 +543,7 @@ Item {
       var stderr = String(putStderr.text || root._putErr || "")
       root.mutating = false
       if (exitCode !== 0) {
-        var failure = Model.parseFailure(stdout, stderr)
+        var failure = Model.captureFailure(exitCode, stdout, stderr)
         if (Model.isAuthError(failure.code)) root.authenticated = false
         root.mutationError = root.conciseError(failure.error, "Could not save the event")
         return
@@ -582,7 +599,9 @@ Item {
     command: Model.setupLockCheckCommand(root.tools)
     onExited: function(exitCode) {
       root.setupRunning = exitCode === 1
-      if (exitCode !== 0 && exitCode !== 1)
+      if (Model.isSupervisorOutcome(exitCode))
+        root.lastError = "Could not check whether calendar setup is already running"
+      else if (exitCode !== 0 && exitCode !== 1)
         root.lastError = "Setup needs a private runtime directory ($XDG_RUNTIME_DIR, mode 700) to run"
     }
   }
