@@ -84,18 +84,68 @@ if [ -f "$race" ]; then
   if /usr/bin/python3 -I -B "$race" "$BR"; then ok "race harness: no signal to a non-owned or reaped target"; else bad "race harness" "see output above"; fi
 fi
 
-if command -v strace >/dev/null; then
+# Checks a strace log: every kill() the supervisor makes comes before it reaps
+# the leader. Exit 0 ok, 1 violation, 2 nothing usable was traced.
+strace_ordering() {
+  /usr/bin/python3 -I -S -B - "$1" <<'PY'
+import re, sys
+calls, pending = [], {}
+for line in open(sys.argv[1], errors="replace"):
+    m = re.match(r"^(\d+)\s+(.*?)\s*$", line)
+    if not m:
+        continue
+    pid, rest = int(m.group(1)), m.group(2)
+    resumed = re.match(r"^<\.\.\. (\w+) resumed>(.*)$", rest)
+    if resumed:
+        index = pending.pop((pid, resumed.group(1)), None)
+        if index is not None:
+            calls[index][2] += resumed.group(2)
+        continue
+    call = re.match(r"^(\w+)\(", rest)
+    if not call:
+        continue  # signal deliveries (---) and exits (+++)
+    entry = [pid, call.group(1), rest]
+    if rest.endswith("<unfinished ...>"):
+        entry[2] = rest[: -len("<unfinished ...>")]
+        pending[(pid, call.group(1))] = len(calls)
+    calls.append(entry)
+if not calls:
+    print("strace recorded no calls")
+    sys.exit(2)
+supervisor = calls[0][0]
+spawn = next((c for c in calls if c[0] == supervisor and c[1] in ("clone", "clone3", "fork", "vfork")), None)
+returned = re.search(r"= (\d+)$", spawn[2]) if spawn else None
+if not returned:
+    print("no child creation by the supervisor was traced")
+    sys.exit(2)
+leader = int(returned.group(1))
+reap = next((i for i, c in enumerate(calls)
+             if c[0] == supervisor and c[1] == "waitid"
+             and re.match(r"waitid\(P_PID, %d," % leader, c[2])
+             and "WNOHANG" not in c[2] and "WNOWAIT" not in c[2]
+             and re.search(r"= 0$", c[2])), None)
+kills = [i for i, c in enumerate(calls) if c[0] == supervisor and c[1] == "kill"]
+if reap is None or not kills:
+    print("leader %d: reap=%s kills=%d" % (leader, reap, len(kills)))
+    sys.exit(1)
+late = [calls[i][2] for i in kills if i > reap]
+if late:
+    print("signal after reaping leader %d: %s" % (leader, late[0]))
+    sys.exit(1)
+print("%d kill(s), all before reaping leader %d" % (len(kills), leader))
+PY
+}
+
+strace_bin=$(command -v strace)
+if [ -n "$strace_bin" ]; then
   log=$(mktemp)
-  env -i PATH=/usr/bin strace -f -qq -o "$log" -e trace=kill,waitid,posix_spawn,clone,clone3 "${PY[@]}" --stdout-cap 100 --stderr-cap 100 --deadline 1 --grace 1 -- /usr/bin/bash -c 'trap "" TERM; /usr/bin/sleep 1001.8 & wait' >/dev/null 2>&1
-  sup=$(head -1 "$log" | cut -d' ' -f1)
-  leader=$(grep -m1 -E "^$sup +clone3?\(.*= [0-9]+$" "$log" | grep -oE '= [0-9]+$' | tr -dc 0-9)
-  reap_line=$(grep -nE "^$sup +waitid\(P_PID, $leader, .*WEXITED\)" "$log" | grep -v WNOWAIT | grep -v WNOHANG | head -1 | cut -d: -f1)
-  last_kill=$(grep -nE "^$sup +kill\(" "$log" | tail -1 | cut -d: -f1)
-  if [ -n "$leader" ] && [ -n "$reap_line" ] && [ -n "$last_kill" ] && [ "$last_kill" -lt "$reap_line" ]; then
-    ok "strace: every kill precedes reaping leader $leader (last kill line $last_kill < reap line $reap_line)"
-  else
-    bad "strace ordering" "leader=$leader reap=$reap_line last_kill=$last_kill log=$log"
-  fi
+  env -i PATH=/usr/bin "$strace_bin" -f -qq -o "$log" -e trace=kill,waitid,clone,clone3,fork,vfork "${PY[@]}" --stdout-cap 100 --stderr-cap 100 --deadline 1 --grace 1 -- /usr/bin/bash -c 'trap "" TERM; /usr/bin/sleep 1001.8 & wait' >/dev/null 2>&1
+  verdict=$(strace_ordering "$log"); rc=$?
+  case $rc in
+    0) ok "strace: $verdict"; rm -f "$log" ;;
+    2) printf 'skip strace ordering (%s; log=%s)\n' "$verdict" "$log" ;;
+    *) bad "strace ordering" "$verdict log=$log" ;;
+  esac
 else
   printf 'skip strace ordering (strace not installed)\n'
 fi
