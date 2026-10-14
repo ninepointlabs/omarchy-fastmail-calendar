@@ -165,8 +165,17 @@ function parseLocalDateTime(value) {
 // entirely (see zonedTimeToUtcMs), so this path is only hit for a zone Intl
 // itself does not recognize, which is treated as "no shift" rather than a
 // crash.
+//
+// Quickshell's QV4 engine has no Intl at all. There the only zone whose rules
+// are reachable is the system's own, via Date#getTimezoneOffset, so any zone
+// normalizeTzid let through (see intlKnowsTimeZone) is read with the local
+// offset — exact for the common case of events in the viewer's own zone.
 function tzOffsetMsAt(utcMs, timeZone) {
   if (!timeZone) return 0
+  if (typeof Intl === "undefined") {
+    if (timeZone === "UTC") return 0
+    return -new Date(utcMs).getTimezoneOffset() * 60000
+  }
   try {
     var formatter = new Intl.DateTimeFormat("en-US", {
       timeZone: timeZone, hourCycle: "h23",
@@ -187,8 +196,9 @@ function tzOffsetMsAt(utcMs, timeZone) {
 
 // Converts a JSCalendar local date-time string in `timeZone` to a UTC epoch
 // ms. `timeZone` of "" or null/undefined is a *floating* time — JSCalendar's
-// term for "no zone attached" — read as-is in whatever zone this code is
-// running in, which is what a floating time is defined to mean to its viewer.
+// term for "no zone attached" — read as local wall-clock time in whatever zone
+// this code is running in, which is what a floating time is defined to mean
+// to its viewer.
 // Fixed-point iteration (never more than a couple of steps in practice)
 // converges even across a DST transition; the skipped/ambiguous hour at the
 // transition itself resolves to one of its two possible instants rather than
@@ -196,8 +206,8 @@ function tzOffsetMsAt(utcMs, timeZone) {
 function zonedTimeToUtcMs(localValue, timeZone) {
   var parsed = parseLocalDateTime(localValue)
   if (!parsed) return NaN
+  if (!timeZone) return new Date(parsed.year, parsed.month - 1, parsed.day, parsed.hour, parsed.minute, parsed.second).getTime()
   var naiveUtc = Date.UTC(parsed.year, parsed.month - 1, parsed.day, parsed.hour, parsed.minute, parsed.second)
-  if (!timeZone) return naiveUtc
   var guess = naiveUtc
   for (var i = 0; i < 3; i++) {
     var offset = tzOffsetMsAt(guess, timeZone)
@@ -211,8 +221,15 @@ function zonedTimeToUtcMs(localValue, timeZone) {
 // The inverse of parseLocalDateTime + zonedTimeToUtcMs's math, used to turn a
 // generated occurrence's own UTC instant back into the local "YYYY-MM-DDTHH:MM:SS"
 // string that is compared against recurrenceOverrides keys (those keys are
-// always in the event's own timeZone, not UTC or the viewer's zone).
+// always in the event's own timeZone, not UTC or the viewer's zone). A
+// floating `timeZone` ("") is the viewer's local wall clock, matching
+// zonedTimeToUtcMs.
 function utcMsToLocalString(utcMs, timeZone) {
+  if (!timeZone) {
+    var wall = new Date(utcMs)
+    return wall.getFullYear() + "-" + pad2(wall.getMonth() + 1) + "-" + pad2(wall.getDate())
+      + "T" + pad2(wall.getHours()) + ":" + pad2(wall.getMinutes()) + ":" + pad2(wall.getSeconds())
+  }
   var offset = tzOffsetMsAt(utcMs, timeZone)
   var local = new Date(utcMs + offset)
   return local.getUTCFullYear() + "-" + pad2(local.getUTCMonth() + 1) + "-" + pad2(local.getUTCDate())
@@ -1689,9 +1706,15 @@ function icsComponents(component, name, out) {
 // and failing that the time is read as floating. Windows-style names
 // ("Central Standard Time") fall into that last bucket — the wall clock
 // shown is then the one typed, in the viewer's zone.
+//
+// Without Intl (Quickshell's QV4 engine) there is no zone database to ask, so
+// any well-formed IANA "Area/City" name is accepted and later read with the
+// system's local offset (see tzOffsetMsAt).
 var knownTimeZones = Object.create(null)
+var ianaAreaCityPattern = /^(Africa|America|Antarctica|Arctic|Asia|Atlantic|Australia|Europe|Indian|Pacific)(\/[A-Za-z0-9_+\-]+){1,2}$/
 
 function intlKnowsTimeZone(name) {
+  if (typeof Intl === "undefined") return ianaAreaCityPattern.test(name)
   if (name in knownTimeZones) return knownTimeZones[name]
   var known = false
   try { new Intl.DateTimeFormat("en-US", { timeZone: name }); known = true } catch (error) { known = false }

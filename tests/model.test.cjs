@@ -83,8 +83,44 @@ test("normalizedWeekStart accepts names, indices and falls back", () => {
 
 // ------------------------------------------------------- Timezone conversion --
 
-test("zonedTimeToUtcMs converts a floating (zoneless) time as-is", () => {
-  assert.equal(Model.zonedTimeToUtcMs("2026-06-01T09:00:00", ""), Date.UTC(2026, 5, 1, 9, 0, 0))
+test("zonedTimeToUtcMs reads a floating (zoneless) time as local wall-clock time", () => {
+  // TZ is pinned to America/Chicago above: 9am CDT is 14:00 UTC.
+  assert.equal(Model.zonedTimeToUtcMs("2026-06-01T09:00:00", ""), new Date(2026, 5, 1, 9, 0, 0).getTime())
+  assert.equal(Model.zonedTimeToUtcMs("2026-06-01T09:00:00", ""), Date.UTC(2026, 5, 1, 14, 0, 0))
+})
+
+test("without Intl (Quickshell's QV4 engine), zoned times resolve through the system's local offset", () => {
+  const savedIntl = globalThis.Intl
+  delete globalThis.Intl
+  try {
+    assert.equal(typeof Intl, "undefined")
+    assert.equal(Model.normalizeTzid("America/Chicago"), "America/Chicago")
+    assert.equal(Model.normalizeTzid("/freeassociation.sourceforge.net/Tzfile/America/Chicago"), "America/Chicago")
+    assert.equal(Model.normalizeTzid("Z"), "UTC")
+    assert.equal(Model.normalizeTzid("Central Standard Time"), "")
+    // The reported bug: a 17:00 America/Chicago event must stay 17:00 local, not 12:00.
+    const value = Model.icsDateValue({ value: "20260601T170000", params: { TZID: ["America/Chicago"] } }, "")
+    assert.deepEqual(value, { allDay: false, local: "2026-06-01T17:00:00", tz: "America/Chicago" })
+    const startMs = Model.zonedTimeToUtcMs(value.local, value.tz)
+    assert.equal(startMs, Date.UTC(2026, 5, 1, 22, 0, 0))
+    assert.equal(new Date(startMs).getHours(), 17)
+    // Both sides of DST still come out right via getTimezoneOffset.
+    assert.equal(Model.zonedTimeToUtcMs("2026-03-02T09:00:00", "America/Chicago"), Date.UTC(2026, 2, 2, 15, 0, 0))
+    assert.equal(Model.zonedTimeToUtcMs("2026-03-09T09:00:00", "America/Chicago"), Date.UTC(2026, 2, 9, 14, 0, 0))
+    assert.equal(Model.zonedTimeToUtcMs("2026-06-01T09:00:00", "UTC"), Date.UTC(2026, 5, 1, 9, 0, 0))
+    assert.equal(Model.utcMsToLocalString(Date.UTC(2026, 5, 1, 22, 0, 0), "America/Chicago"), "2026-06-01T17:00:00")
+    // Floating stays local wall-clock time too.
+    assert.equal(Model.zonedTimeToUtcMs("2026-06-01T17:00:00", ""), Date.UTC(2026, 5, 1, 22, 0, 0))
+  } finally {
+    globalThis.Intl = savedIntl
+  }
+})
+
+test("a floating master's override key reads a UTC RECURRENCE-ID as local wall time", () => {
+  assert.equal(Model.utcMsToLocalString(Date.UTC(2026, 5, 1, 22, 0, 0), ""), "2026-06-01T17:00:00")
+  // A RECURRENCE-ID of 22:00Z keys the floating 17:00 (CDT) instance, not a nonexistent 22:00 one.
+  assert.equal(Model.localKeyInZone({ allDay: false, local: "2026-06-01T22:00:00", tz: "UTC" }, "", false), "2026-06-01T17:00:00")
+  assert.equal(Model.localKeyInZone({ allDay: false, local: "2026-06-01T17:00:00", tz: "" }, "", false), "2026-06-01T17:00:00")
 })
 
 test("zonedTimeToUtcMs resolves America/Chicago correctly on both sides of DST", () => {
@@ -211,12 +247,12 @@ test("recurrenceOverrides excludes, moves and retitles instances", () => {
   }
   const occurrences = Model.expandOccurrences(event, Date.UTC(2026, 0, 1), Date.UTC(2026, 1, 1))
   assert.equal(occurrences.length, 3)
-  assert.equal(occurrences[0].startMs, Date.UTC(2026, 0, 5, 9, 0, 0))
+  assert.equal(occurrences[0].startMs, new Date(2026, 0, 5, 9, 0, 0).getTime())
   assert.equal(occurrences[0].title, "Standup")
-  assert.equal(occurrences[1].startMs, Date.UTC(2026, 0, 19, 14, 0, 0))
+  assert.equal(occurrences[1].startMs, new Date(2026, 0, 19, 14, 0, 0).getTime())
   assert.equal(occurrences[1].title, "Moved meeting")
   assert.equal(occurrences[1].moved, true)
-  assert.equal(occurrences[2].startMs, Date.UTC(2026, 0, 26, 9, 0, 0))
+  assert.equal(occurrences[2].startMs, new Date(2026, 0, 26, 9, 0, 0).getTime())
 })
 
 test("recurrence expansion is bounded regardless of how open-ended the rule is", () => {
@@ -775,6 +811,8 @@ test("parseRrule maps RRULE onto the recurrence engine's rule shape, with UNTIL 
   assert.deepEqual(Model.parseRrule("FREQ=YEARLY;BYMONTH=7;BYMONTHDAY=4;COUNT=3", ""), { frequency: "yearly", byMonth: [7], byMonthDay: [4], count: 3 })
   assert.deepEqual(Model.parseRrule("FREQ=DAILY;UNTIL=20260320", ""), { frequency: "daily", until: "2026-03-20T23:59:59" })
   assert.equal(Model.parseRrule("INTERVAL=2", ""), null)
+  // A UTC UNTIL on a floating master is re-expressed as local wall time (TZ is America/Chicago, CDT).
+  assert.deepEqual(Model.parseRrule("FREQ=DAILY;UNTIL=20260601T220000Z", ""), { frequency: "daily", until: "2026-06-01T17:00:00" })
 })
 
 const sampleIcs = [
