@@ -221,8 +221,15 @@ function zonedTimeToUtcMs(localValue, timeZone) {
 // The inverse of parseLocalDateTime + zonedTimeToUtcMs's math, used to turn a
 // generated occurrence's own UTC instant back into the local "YYYY-MM-DDTHH:MM:SS"
 // string that is compared against recurrenceOverrides keys (those keys are
-// always in the event's own timeZone, not UTC or the viewer's zone).
+// always in the event's own timeZone, not UTC or the viewer's zone). A
+// floating `timeZone` ("") is the viewer's local wall clock, matching
+// zonedTimeToUtcMs.
 function utcMsToLocalString(utcMs, timeZone) {
+  if (!timeZone) {
+    var wall = new Date(utcMs)
+    return wall.getFullYear() + "-" + pad2(wall.getMonth() + 1) + "-" + pad2(wall.getDate())
+      + "T" + pad2(wall.getHours()) + ":" + pad2(wall.getMinutes()) + ":" + pad2(wall.getSeconds())
+  }
   var offset = tzOffsetMsAt(utcMs, timeZone)
   var local = new Date(utcMs + offset)
   return local.getUTCFullYear() + "-" + pad2(local.getUTCMonth() + 1) + "-" + pad2(local.getUTCDate())
