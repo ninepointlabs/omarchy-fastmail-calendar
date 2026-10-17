@@ -7,9 +7,9 @@ output caps, a deadline and process-group termination — now enforced by this
 plugin's own `bin/bounded-run` supervisor rather than the original shell
 guard), the panel/day-detail/bar
 widget layout in `Panel.qml`, `DayDetail.qml` and `BarWidget.qml`, and the
-overall Service.qml process-orchestration shape are adapted from Ninepoint
+overall Service.qml process-orchestration shape are adapted from Nine Point
 Labs' `omarchy-hey-calendar` plugin (MIT License, Copyright (c) 2026
-Ninepoint Labs), itself descended from 37signals' `37signals.hey` Omarchy
+Nine Point Labs), itself descended from 37signals' `37signals.hey` Omarchy
 plugin (MIT License, Copyright (c) 2026 37signals LLC) and, for the date
 math, from Omarchy's own built-in `omarchy.clock` shell plugin
 (`/usr/share/omarchy/shell/plugins/panels/clock`), so the Month and Year
@@ -19,8 +19,8 @@ attribution under the terms of those licenses.
 The setup flow's lock-directory/floating-terminal/IPC-completion structure
 (`setupLockShell`, `setupLockCheckCommand`, `setupLaunchCommand` in
 `Model.js`, and the matching `setupFinished` IPC handler in `BarWidget.qml`)
-is adapted from Ninepoint Labs' `omarchy-fastmail` plugin (MIT License,
-Copyright (c) 2026 Ninepoint Labs), reused with attribution under the terms
+is adapted from Nine Point Labs' `omarchy-fastmail` plugin (MIT License,
+Copyright (c) 2026 Nine Point Labs), reused with attribution under the terms
 of that license. This plugin's own setup flow captures a CalDAV app
 password directly rather than driving `fm-cli`'s OAuth login — the two
 plugins share no runtime dependency and no credential.

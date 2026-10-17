@@ -12,8 +12,8 @@ import "Model.js" as Model
 // The calendar panel: Today/Week/Month/Year view switcher, a day-detail
 // overlay (read-only: title, time, location, calendar) opened by clicking any
 // day in Week/Month/Year, and a Calendars settings page for per-calendar
-// visibility, color and display name. Today embeds the day-detail content
-// directly since it's the landing view.
+// visibility, color and display name, and an About page (AboutPage.qml).
+// Today embeds the day-detail content directly since it's the landing view.
 Panel {
   id: root
   moduleName: "ninepointlabs.fastmail-calendar"
@@ -36,6 +36,15 @@ Panel {
   readonly property date dayDetailDate: dayDetailKey !== "" ? (Model.dateFromKey(dayDetailKey) || today) : today
 
   property bool calendarSettingsOpen: false
+  property bool aboutOpen: false
+
+  // This plugin's own folder, for the About page's manifest.json, LICENSE
+  // and THIRD_PARTY_NOTICES.md.
+  readonly property string pluginDir: {
+    var text = String(Qt.resolvedUrl("."))
+    if (text.indexOf("file://") === 0) text = decodeURIComponent(text.substring(7))
+    return text.length > 1 && text.charAt(text.length - 1) === "/" ? text.substring(0, text.length - 1) : text
+  }
 
   // One service per shell — every bar widget and every open panel reads the
   // same instance, so switching views never fires more than one server
@@ -162,6 +171,23 @@ Panel {
     Qt.callLater(function() { keyCatcher.forceActiveFocus() })
   }
 
+  function setAbout(on) {
+    if (on) {
+      dayDetailOpen = false
+      calendarSettingsOpen = false
+      aboutPage.reset()
+      aboutFlick.contentY = 0
+    }
+    aboutOpen = on
+    Qt.callLater(function() { keyCatcher.forceActiveFocus() })
+  }
+
+  // The `about` IPC call: open the panel straight onto About.
+  function showAboutPage() {
+    if (!opened) open()
+    setAbout(true)
+  }
+
   function switchPanel(direction) {
     if (root.bar && typeof root.bar.switchPanelFrom === "function")
       return root.bar.switchPanelFrom(root.barIdentity, direction)
@@ -243,6 +269,7 @@ Panel {
     if (!opened) {
       dayDetailOpen = false
       calendarSettingsOpen = false
+      aboutOpen = false
       goToToday()
       return
     }
@@ -295,7 +322,9 @@ Panel {
     focusTarget: keyCatcher
     contentWidth: panel.fittedContentWidth(Style.space(620))
     contentHeight: panel.fittedContentHeight(
-      root.dayDetailOpen
+      root.aboutOpen
+        ? aboutHeader.implicitHeight + aboutPage.implicitHeight + Style.space(48)
+        : root.dayDetailOpen
         ? dayDetailInner.implicitHeight + Style.space(24)
         : (root.calendarSettingsOpen
           ? calendarSettingsInner.implicitHeight + Style.space(24)
@@ -307,15 +336,19 @@ Panel {
       anchors.fill: parent
       blocked: root.dayDetailOpen || root.calendarSettingsOpen
       onMoveRequested: function(dx, dy) {
+        if (root.aboutOpen) return
         if (root.currentView === "month") { if (dx !== 0) root.moveMonth(dx); if (dy !== 0) root.moveYear(dy) }
         else if (root.currentView === "week" && dx !== 0) root.moveWeek(dx)
         else if (root.currentView === "year" && dy !== 0) root.moveYear(dy)
       }
-      onActivateRequested: root.goToToday()
-      onCloseRequested: root.close()
+      onActivateRequested: if (!root.aboutOpen) root.goToToday()
+      // Esc steps back out of About before it closes the panel.
+      onCloseRequested: root.aboutOpen ? root.setAbout(false) : root.close()
       onTabRequested: function(direction) { root.switchPanel(direction) }
       onTextKey: function(t) {
-        if (t === "t" || t === "T") root.goToToday()
+        if (t === "i" || t === "I") root.setAbout(!root.aboutOpen)
+        else if (root.aboutOpen) return
+        else if (t === "t" || t === "T") root.goToToday()
         else if (t === "r" || t === "R") root.refresh()
         else if (t === "1") root.setView("today")
         else if (t === "2") root.setView("week")
@@ -328,7 +361,7 @@ Panel {
       ColumnLayout {
         id: content
         anchors.fill: parent
-        visible: !root.dayDetailOpen && !root.calendarSettingsOpen
+        visible: !root.dayDetailOpen && !root.calendarSettingsOpen && !root.aboutOpen
         spacing: Style.space(12)
 
         Column {
@@ -380,6 +413,15 @@ Panel {
                 foreground: root.foreground
                 fontFamily: root.fontFamily
                 onClicked: root.calendarSettingsOpen = true
+              }
+
+              PanelActionButton {
+                objectName: "aboutButton"
+                iconText: "󰋽"
+                tooltipText: "About (I)"
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+                onClicked: root.setAbout(true)
               }
 
               PanelActionButton {
@@ -1093,6 +1135,69 @@ Panel {
               verticalPadding: Style.space(2)
               onClicked: if (service) service.forgetCredentials()
             }
+          }
+        }
+      }
+
+      // -------------------------------------------------------- About page --
+      ColumnLayout {
+        id: aboutPageLayout
+        objectName: "aboutPageLayout"
+        anchors.fill: parent
+        visible: root.aboutOpen
+        spacing: Style.space(12)
+
+        Item {
+          id: aboutHeader
+          Layout.fillWidth: true
+          implicitHeight: Math.max(aboutHeaderText.implicitHeight, aboutCloseButton.implicitHeight)
+
+          Text {
+            id: aboutHeaderText
+            textFormat: Text.PlainText
+            anchors.left: parent.left
+            anchors.right: aboutCloseButton.left
+            anchors.rightMargin: Style.space(8)
+            text: "ABOUT"
+            color: root.foreground
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.title
+            font.bold: true
+          }
+
+          PanelActionButton {
+            id: aboutCloseButton
+            objectName: "aboutBack"
+            anchors.right: parent.right
+            anchors.verticalCenter: parent.verticalCenter
+            iconText: "󰅖"
+            tooltipText: "Back (Esc)"
+            foreground: root.foreground
+            fontFamily: root.fontFamily
+            onClicked: root.setAbout(false)
+          }
+        }
+
+        PanelSeparator { foreground: root.foreground }
+
+        Flickable {
+          id: aboutFlick
+          Layout.fillWidth: true
+          Layout.fillHeight: true
+          contentWidth: width
+          contentHeight: aboutPage.implicitHeight
+          clip: true
+          boundsBehavior: Flickable.StopAtBounds
+          interactive: contentHeight > height
+          ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
+
+          AboutPage {
+            id: aboutPage
+            width: aboutFlick.width
+            pluginDir: root.pluginDir
+            foreground: root.foreground
+            accent: root.accent
+            fontFamily: root.fontFamily
           }
         }
       }

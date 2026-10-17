@@ -61,6 +61,14 @@ that the same code reads any other CalDAV server too.
   the panel's event labels or 24-hour via **Time format**; it follows the
   date, or leads the next event when that is what the chip is showing.
 
+- **About** — the 󰋽 button in the panel header (or `I` with the panel
+  open, or `omarchy-shell ninepointlabs.fastmail-calendar about`) shows the
+  version, license and third-party notices (readable in place), Nine Point
+  Labs, what the plugin does with your data, and the support address,
+  [help@ninepointlabs.com](mailto:help@ninepointlabs.com), with **Email**,
+  **Copy** and **Copy version details** buttons. `Esc` or the close button
+  goes back.
+
 There is no edit or delete for events yet, and no journal.
 
 ## Setup
@@ -115,6 +123,7 @@ With the panel open:
 | `Enter` | Jump to today |
 | `1` `2` `3` `4` | Today / Week / Month / Year |
 | `C` | Calendars |
+| `I` | About |
 | `R` | Refresh |
 | `Esc` | Close a detail page, then the panel |
 | `Tab` `Shift+Tab` | Switch to the next or previous bar panel |
@@ -123,7 +132,7 @@ With the panel open:
 
 This plugin never runs a mail or calendar CLI: it talks CalDAV over HTTPS
 through `curl` — as a bounded child process, output-size- and time-capped,
-the same as every other Ninepoint Labs Omarchy plugin.
+the same as every other Nine Point Labs Omarchy plugin.
 
 - **Every executable is bound to a trusted absolute path, never resolved
   through your `PATH`.** At startup the plugin builds a tool table by looking
@@ -250,7 +259,7 @@ status and address). Reports welcome.
 ## Demo and tests
 
 ```bash
-node --test tests/model.test.cjs
+node --test tests/model.test.cjs tests/about.test.cjs
 tests/bounded-run.test.sh bin/bounded-run
 ```
 
@@ -266,7 +275,10 @@ Pure JS: date/grid math, timezone-safe recurrence expansion, CalDAV
 discovery and request framing, WebDAV multistatus and iCalendar parsing
 (including `EXDATE`/`RECURRENCE-ID` handling across a real DST change),
 iCalendar generation for new events, the credential/setup scripts' shape,
-and calendar preference persistence. There
+and calendar preference persistence. `tests/about.test.cjs` checks the
+About page's facts against the real `manifest.json`, `LICENSE` and first
+commit, and fails if the code names a network host that the privacy
+statement does not. There
 is no Quickshell/QML test harness in this checkout yet — the QML files
 follow the same structure as `omarchy-hey-calendar`'s and are lint-clean
 under `qmllint`, but exercising them needs a live Omarchy shell.
@@ -280,7 +292,7 @@ omarchy plugin remove ninepointlabs.fastmail-calendar --yes
 
 ## Credits
 
-Adapted from Ninepoint Labs' [omarchy-hey-calendar](https://github.com/ninepointlabs/omarchy-hey-calendar)
+Adapted from Nine Point Labs' [omarchy-hey-calendar](https://github.com/ninepointlabs/omarchy-hey-calendar)
 and [omarchy-fastmail](https://github.com/ninepointlabs/omarchy-fastmail)
 (both MIT). Full attributions are in
 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

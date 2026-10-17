@@ -1227,7 +1227,7 @@ var eventTitleInputLimit = 256
 var eventLocationInputLimit = 160
 var eventDescriptionInputLimit = 2000
 
-// Adapted from omarchy-hey-calendar's Model.js (MIT, Ninepoint Labs).
+// Adapted from omarchy-hey-calendar's Model.js (MIT, Nine Point Labs).
 function normalizeTimeOfDay(value) {
   var text = String(value || "").trim().toLowerCase()
   var match = text.match(/^(\d{1,2})(?:[:.]([0-5]\d))?\s*(am|pm|a|p)?$/)
@@ -1304,7 +1304,7 @@ function prepareNewEvent(fields) {
   var nowMs = Number(input.nowMs || Date.now())
 
   var lines = [
-    "BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//Ninepoint Labs//Fastmail Calendar for Omarchy//EN",
+    "BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//Nine Point Labs//Fastmail Calendar for Omarchy//EN",
     "BEGIN:VEVENT",
     "UID:" + uid,
     "DTSTAMP:" + icsStamp(nowMs),

@@ -3,7 +3,7 @@
   "id": "ninepointlabs.fastmail-calendar",
   "name": "Fastmail Calendar",
   "version": "0.1.0",
-  "author": "Ninepoint Labs",
+  "author": "Nine Point Labs",
   "license": "MIT",
   "description": "Native Omarchy calendar — Today, Week, Month and Year views with day detail and quick add-event — over CalDAV. Fastmail by default; any CalDAV server works.",
   "kinds": [

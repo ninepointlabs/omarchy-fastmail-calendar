@@ -119,6 +119,8 @@ BarWidget {
     function show(): void { root.open() }
     function hide(): void { root.close() }
     function toggle(): void { root.togglePanel() }
+    // Opens the panel on its About page: version, license, support, privacy.
+    function about(): void { if (panelLoader.item) panelLoader.item.showAboutPage() }
     // Called back by the floating setup terminal's completion trap once the
     // credential-capture script exits, success or cancel either way, so the
     // panel's setup state and "setup running" lock re-check immediately
